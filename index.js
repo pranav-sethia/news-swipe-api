@@ -18,8 +18,10 @@ const pool = new Pool({
 });
 
 // --- Middleware ---
-app.use(cors());
+const allowedOrigin = process.env.FRONTEND_URL;
+app.use(cors({ origin: allowedOrigin }));
 app.use(express.json());
+
 
 // --- HELPER FUNCTION: Average multiple vectors ---
 function averageVectors(vectorStrings) {
