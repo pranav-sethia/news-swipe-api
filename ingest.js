@@ -4,9 +4,10 @@ require('dotenv').config();
 const axios = require('axios');
 const { Pool } = require('pg');
 
-// 2. Setup GNews and ML API constants
+// --- 2. Setup GNews and ML API constants ---
 const GNEWS_API_KEY = process.env.GNEWS_API_KEY;
-const ML_API_URL = 'http://127.0.0.1:8000/embed'; // Your Python "Brain"
+// CRITICAL FIX: Use the Hugging Face URL provided by the environment variable
+const ML_API_URL = process.env.ML_SERVICE_URL; 
 const CATEGORIES = ['general', 'technology', 'science', 'sports', 'entertainment'];
 const ARTICLES_PER_CATEGORY = 50; // We ask for 50, free tier gives ~10
 
@@ -30,11 +31,23 @@ const getEmbedding = async (text) => {
   if (!text || text.trim().length === 0) {
     return null;
   }
+  
+  // CRITICAL FIX: Gradio API path and structure
+  const GRADIO_PREDICT_URL = `${ML_API_URL}/run/predict`;
+
   try {
-    const response = await axios.post(ML_API_URL, { text });
-    return response.data.embedding;
+    const response = await axios.post(GRADIO_PREDICT_URL, {
+        // Gradio expects a fixed input format (data property containing inputs as an array)
+        data: [text] 
+    });
+    
+    // Gradio returns a JSON array: { "data": [ { "embedding": [...] } ] }
+    const embeddingData = response.data.data[0]; 
+    return embeddingData.embedding;
+
   } catch (err) {
-    console.error(`Error getting embedding for text: ${text.substring(0, 20)}...`, err.message);
+    console.error(`Error getting embedding for text: ${text.substring(0, 20)}...`);
+    console.error(`Status: ${err.response ? err.response.status : 'Network Error'}. Please ensure ML_SERVICE_URL is correct.`);
     return null;
   }
 };
@@ -49,22 +62,30 @@ const ingestArticles = async () => {
     console.error('❌ GNEWS_API_KEY is not set in .env file. Exiting.');
     return;
   }
+  
+  if (!ML_API_URL || ML_API_URL.includes('localhost')) {
+    console.error('❌ ML_SERVICE_URL is not set or is set to localhost. Deployment requires a public URL.');
+    return;
+  }
 
   let totalProcessedCount = 0;
-  const client = await pool.connect();
-  console.log('✅ Connected to Azure DB.');
-
+  let client;
   try {
+    client = await pool.connect();
+    console.log('✅ Connected to Azure DB.');
+
     for (const category of CATEGORIES) {
       console.log(`\nFetching category: ${category}...`);
       
       const gnewsUrl = `https://gnews.io/api/v4/top-headlines?lang=en&max=${ARTICLES_PER_CATEGORY}&topic=${category}&token=${GNEWS_API_KEY}`;
       let response;
+      
+      // CRITICAL: Handle API Rate Limits
       try {
         response = await axios.get(gnewsUrl);
       } catch (err) {
         if (err.response && err.response.status === 429) {
-          console.error(`❌ Rate limit hit for category: ${category}. Stopping ingestion. Try again later.`);
+          console.error(`❌ Rate limit hit for category: ${category}. Stopping ingestion. Try again tomorrow.`);
           break; // Stop the loop if we get a 429
         }
         throw err; // Re-throw other errors
@@ -89,8 +110,8 @@ const ingestArticles = async () => {
         const textToEmbed = `${article.title}. ${article.description}`;
         const embedding = await getEmbedding(textToEmbed);
 
-        if (!embedding) {
-          console.warn(`Could not get embedding for: ${article.title}`);
+        if (!embedding || embedding.error) {
+          console.warn(`Could not get embedding for: ${article.title}. Skipping.`);
           continue;
         }
 
@@ -131,8 +152,10 @@ const ingestArticles = async () => {
   } catch (err) {
     console.error('Error during ingestion process:', err.message);
   } finally {
-    client.release();
-    console.log('\nReleased DB client.');
+    if (client) {
+        client.release();
+        console.log('\nReleased DB client.');
+    }
   }
 
   console.log(`\n--- Ingestion Complete ---`);
