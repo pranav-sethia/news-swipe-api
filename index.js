@@ -146,11 +146,6 @@ app.get('/api/feed', async (req, res) => {
       const smartRows = (await pool.query(smartQuery, queryParams)).rows;
       finalFeed.push(...smartRows);
 
-        // In index.js, after the smartQuery
-        console.log('📊 SMART FEED RESULTS:');
-        smartRows.forEach((article, i) => {
-        console.log(`  ${i+1}. ${article.title} (similarity: ${article.similarity.toFixed(3)})`);
-        });
 
       // 2. Get 3 DUMB articles for exploration
       const smartArticleIds = smartRows.map(a => a.id);
