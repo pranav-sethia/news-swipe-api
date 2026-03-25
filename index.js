@@ -168,7 +168,7 @@ app.get('/api/feed', async (req, res) => {
       
       // 1. Get 7 SMART articles
       const smartQuery = `
-        SELECT id, title, description, article_url, image_url, source_name, published_at, (1 - (embedding <=> $2)) as similarity
+        SELECT id, title, description, article_url, image_url, source_name, published_at, score, num_comments, hn_id, (1 - (embedding <=> $2)) as similarity
         FROM articles
         WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1)
         ORDER BY similarity DESC
@@ -183,9 +183,9 @@ app.get('/api/feed', async (req, res) => {
       const idPlaceholders = smartArticleIds.length > 0 ? smartArticleIds.join(',') : '0';
 
       const dumbQuery = `
-        SELECT * FROM articles
+        SELECT *, NULL as similarity FROM articles
         WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1)
-        AND id NOT IN (${idPlaceholders}) -- Exclude smart articles
+        AND id NOT IN (${idPlaceholders})
         ORDER BY RANDOM()
         LIMIT ${DUMB_FEED_SIZE};
       `;

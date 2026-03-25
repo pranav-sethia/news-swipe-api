@@ -124,7 +124,7 @@ async function ingestArticles() {
 
   try {
     for (const hit of hits) {
-      const { title, url, points, author, created_at, story_text, objectID } = hit;
+      const { title, url, points, author, created_at, story_text, objectID, num_comments } = hit;
 
       // --- Filter: must have a title and external URL ---
       if (!title || !url) {
@@ -168,19 +168,24 @@ async function ingestArticles() {
       const embeddingString = `[${embedding.join(',')}]`;
       const query = `
         INSERT INTO articles
-          (title, description, article_url, image_url, source_name, published_at, embedding)
+          (title, description, article_url, image_url, source_name, published_at, embedding, score, num_comments, hn_id)
         VALUES
-          ($1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (article_url) DO NOTHING;
+          ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ON CONFLICT (article_url) DO UPDATE SET
+          score = EXCLUDED.score,
+          num_comments = EXCLUDED.num_comments;
       `;
       const values = [
         title,
         description,
-        url,          // Link to the actual article
-        imageUrl,     // Can be null — the UI handles this gracefully
+        url,
+        imageUrl,
         sourceName,
         publishedAt,
         embeddingString,
+        points ?? null,
+        num_comments ?? null,
+        objectID,
       ];
 
       const result = await client.query(query, values);
