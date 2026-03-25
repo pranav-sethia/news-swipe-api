@@ -1,15 +1,25 @@
-// 1. Load environment variables
 require('dotenv').config();
 
 const axios = require('axios');
 const { Pool } = require('pg');
 
+// --- Helper function for delay ---
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// --- NEW FIX: Function to clean the base URL ---
+const cleanUrl = (url) => {
+    if (!url) return '';
+    // Ensures there is no trailing slash so we can safely append /api/predict
+    return url.endsWith('/') ? url.slice(0, -1) : url; 
+};
+// --- END NEW FIX ---
+
 // --- 2. Setup GNews and ML API constants ---
 const GNEWS_API_KEY = process.env.GNEWS_API_KEY;
-// CRITICAL FIX: Use the Hugging Face URL provided by the environment variable
-const ML_API_URL = process.env.ML_SERVICE_URL; 
+// CRITICAL: Ensure ML_API_URL is clean
+const ML_API_URL = cleanUrl(process.env.ML_SERVICE_URL); 
 const CATEGORIES = ['general', 'technology', 'science', 'sports', 'entertainment'];
-const ARTICLES_PER_CATEGORY = 50; // We ask for 50, free tier gives ~10
+const ARTICLES_PER_CATEGORY = 50; 
 
 // 3. Setup Database connection
 const pool = new Pool({
@@ -18,9 +28,6 @@ const pool = new Pool({
     rejectUnauthorized: false,
   },
 });
-
-// --- Helper function for delay ---
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
  * Fetches the embedding for a given text from our ML service.
@@ -32,17 +39,27 @@ const getEmbedding = async (text) => {
     return null;
   }
   
-  // CRITICAL FIX: Gradio API path and structure
-  const GRADIO_PREDICT_URL = `${ML_API_URL}/run/predict`;
+  // FIX: The correct endpoint path for the Gradio Blocks API is /api/predict
+  const GRADIO_PREDICT_URL = `${ML_API_URL}/api/predict`;
 
   try {
     const response = await axios.post(GRADIO_PREDICT_URL, {
-        // Gradio expects a fixed input format (data property containing inputs as an array)
         data: [text] 
+    }, {
+        // We use the 'headers' object to prevent the 401 Unauthorized error
+        headers: {
+            'Gradio-Api-Client': 'js' 
+        }
     });
     
-    // Gradio returns a JSON array: { "data": [ { "embedding": [...] } ] }
+    // We expect the embedding to be in the first element of the data array
     const embeddingData = response.data.data[0]; 
+    
+    // Safety check for embedding errors returned by the ML service
+    if (embeddingData.error || !embeddingData.embedding) {
+        return null;
+    }
+    
     return embeddingData.embedding;
 
   } catch (err) {
@@ -63,8 +80,8 @@ const ingestArticles = async () => {
     return;
   }
   
-  if (!ML_API_URL || ML_API_URL.includes('localhost')) {
-    console.error('❌ ML_SERVICE_URL is not set or is set to localhost. Deployment requires a public URL.');
+  if (!ML_API_URL) {
+    console.error('❌ ML_SERVICE_URL is not set. Deployment requires a public URL.');
     return;
   }
 
@@ -80,7 +97,6 @@ const ingestArticles = async () => {
       const gnewsUrl = `https://gnews.io/api/v4/top-headlines?lang=en&max=${ARTICLES_PER_CATEGORY}&topic=${category}&token=${GNEWS_API_KEY}`;
       let response;
       
-      // CRITICAL: Handle API Rate Limits
       try {
         response = await axios.get(gnewsUrl);
       } catch (err) {
@@ -110,7 +126,8 @@ const ingestArticles = async () => {
         const textToEmbed = `${article.title}. ${article.description}`;
         const embedding = await getEmbedding(textToEmbed);
 
-        if (!embedding || embedding.error) {
+        // Check if the embedding call failed or returned an error object
+        if (!embedding) {
           console.warn(`Could not get embedding for: ${article.title}. Skipping.`);
           continue;
         }
