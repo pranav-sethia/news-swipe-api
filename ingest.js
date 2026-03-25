@@ -1,185 +1,207 @@
 require('dotenv').config();
 
 const axios = require('axios');
+const cheerio = require('cheerio');
 const { Pool } = require('pg');
 
-// --- Helper function for delay ---
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+const ML_API_URL = (process.env.ML_SERVICE_URL || '').replace(/\/$/, '');
+const GRADIO_PREDICT_URL = `${ML_API_URL}/api/predict`;
 
-// --- NEW FIX: Function to clean the base URL ---
-const cleanUrl = (url) => {
-    if (!url) return '';
-    // Ensures there is no trailing slash so we can safely append /api/predict
-    return url.endsWith('/') ? url.slice(0, -1) : url; 
-};
-// --- END NEW FIX ---
+const HN_ALGOLIA_URL =
+  'https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=100';
 
-// --- 2. Setup GNews and ML API constants ---
-const GNEWS_API_KEY = process.env.GNEWS_API_KEY;
-// CRITICAL: Ensure ML_API_URL is clean
-const ML_API_URL = cleanUrl(process.env.ML_SERVICE_URL); 
-const CATEGORIES = ['general', 'technology', 'science', 'sports', 'entertainment'];
-const ARTICLES_PER_CATEGORY = 50; 
+// Minimum points a story must have to be ingested (filters out low-quality posts)
+const MIN_POINTS = 10;
 
-// 3. Setup Database connection
+// Timeout (ms) for OpenGraph image scraping — we don't want to block the pipeline
+const OG_FETCH_TIMEOUT_MS = 4000;
+
+// ---------------------------------------------------------------------------
+// Database
+// ---------------------------------------------------------------------------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false,
-  },
+  ssl: { rejectUnauthorized: false },
 });
 
-/**
- * Fetches the embedding for a given text from our ML service.
- * @param {string} text The text to embed.
- * @returns {Promise<number[]|null>} The vector embedding or null.
- */
-const getEmbedding = async (text) => {
-  if (!text || text.trim().length === 0) {
-    return null;
-  }
-  
-  // FIX: The correct endpoint path for the Gradio Blocks API is /api/predict
-  const GRADIO_PREDICT_URL = `${ML_API_URL}/api/predict`;
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
+/** Small delay to avoid hammering external services */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Fetches a vector embedding from the Hugging Face ML service.
+ * @param {string} text
+ * @returns {Promise<number[]|null>}
+ */
+async function getEmbedding(text) {
+  if (!text || text.trim().length === 0) return null;
   try {
-    const response = await axios.post(GRADIO_PREDICT_URL, {
-        data: [text] 
-    }, {
-        // We use the 'headers' object to prevent the 401 Unauthorized error
-        headers: {
-            'Gradio-Api-Client': 'js' 
-        }
-    });
-    
-    // We expect the embedding to be in the first element of the data array
-    const embeddingData = response.data.data[0]; 
-    
-    // Safety check for embedding errors returned by the ML service
-    if (embeddingData.error || !embeddingData.embedding) {
-        return null;
+    const response = await axios.post(
+      GRADIO_PREDICT_URL,
+      { data: [text.substring(0, 2000)] },
+      { headers: { 'Gradio-Api-Client': 'js' } }
+    );
+    const embeddingData = response.data?.data?.[0];
+    if (!embeddingData || embeddingData.error || !embeddingData.embedding) {
+      return null;
     }
-    
     return embeddingData.embedding;
-
   } catch (err) {
-    console.error(`Error getting embedding for text: ${text.substring(0, 20)}...`);
-    console.error(`Status: ${err.response ? err.response.status : 'Network Error'}. Please ensure ML_SERVICE_URL is correct.`);
+    console.warn(
+      `  ⚠️  Embedding failed: ${err.response?.status ?? 'Network Error'}`
+    );
     return null;
   }
-};
+}
 
 /**
- * Main function to fetch, process, and ingest articles.
+ * Attempts to scrape the OpenGraph image URL from an article page.
+ * Returns null if the page is unreachable, too slow, or has no og:image tag.
+ * @param {string} url
+ * @returns {Promise<string|null>}
  */
-const ingestArticles = async () => {
-  console.log('--- Starting data ingestion ---');
-
-  if (!GNEWS_API_KEY) {
-    console.error('❌ GNEWS_API_KEY is not set in .env file. Exiting.');
-    return;
-  }
-  
-  if (!ML_API_URL) {
-    console.error('❌ ML_SERVICE_URL is not set. Deployment requires a public URL.');
-    return;
-  }
-
-  let totalProcessedCount = 0;
-  let client;
+async function getOgImage(url) {
   try {
-    client = await pool.connect();
-    console.log('✅ Connected to Azure DB.');
+    const response = await axios.get(url, {
+      timeout: OG_FETCH_TIMEOUT_MS,
+      // Only download the first 50 KB — enough to find the <head> tags
+      maxContentLength: 50_000,
+      responseType: 'text',
+      headers: {
+        // Pretend to be a normal browser so sites don't block us
+        'User-Agent':
+          'Mozilla/5.0 (compatible; NewsSwipeBot/1.0; +https://news-swipe-ui.vercel.app)',
+        Accept: 'text/html',
+      },
+    });
+    const $ = cheerio.load(response.data);
+    const ogImage =
+      $('meta[property="og:image"]').attr('content') ||
+      $('meta[name="twitter:image"]').attr('content') ||
+      null;
+    return ogImage || null;
+  } catch {
+    // Silently return null — many HN links will timeout or block scrapers
+    return null;
+  }
+}
 
-    for (const category of CATEGORIES) {
-      console.log(`\nFetching category: ${category}...`);
-      
-      const gnewsUrl = `https://gnews.io/api/v4/top-headlines?lang=en&max=${ARTICLES_PER_CATEGORY}&topic=${category}&token=${GNEWS_API_KEY}`;
-      let response;
-      
-      try {
-        response = await axios.get(gnewsUrl);
-      } catch (err) {
-        if (err.response && err.response.status === 429) {
-          console.error(`❌ Rate limit hit for category: ${category}. Stopping ingestion. Try again tomorrow.`);
-          break; // Stop the loop if we get a 429
-        }
-        throw err; // Re-throw other errors
-      }
+// ---------------------------------------------------------------------------
+// Main ingestion pipeline
+// ---------------------------------------------------------------------------
+async function ingestArticles() {
+  console.log('🚀 Starting Hacker News ingestion pipeline...\n');
 
-      const articles = response.data.articles;
+  if (!ML_API_URL) {
+    console.error('❌ ML_SERVICE_URL is not set. Exiting.');
+    process.exit(1);
+  }
 
-      if (!articles || articles.length === 0) {
-        console.log(`No articles found for category: ${category}.`);
+  // 1. Fetch top HN front page stories from Algolia
+  console.log('📡 Fetching Hacker News front page from Algolia...');
+  let hits;
+  try {
+    const { data } = await axios.get(HN_ALGOLIA_URL);
+    hits = data.hits;
+    console.log(`   Found ${hits.length} stories.\n`);
+  } catch (err) {
+    console.error('❌ Failed to fetch from HN Algolia API:', err.message);
+    process.exit(1);
+  }
+
+  // 2. Connect to the database
+  const client = await pool.connect();
+  console.log('✅ Connected to database.\n');
+
+  let savedCount = 0;
+  let skippedCount = 0;
+
+  try {
+    for (const hit of hits) {
+      const { title, url, points, author, created_at, story_text, objectID } = hit;
+
+      // --- Filter: must have a title and external URL ---
+      if (!title || !url) {
+        skippedCount++;
         continue;
       }
 
-      console.log(`Found ${articles.length} articles for ${category}.`);
-      let categoryProcessedCount = 0;
-
-      for (const article of articles) {
-        if (!article.title || !article.image || !article.description) {
-          console.warn(`Skipping article with missing data: ${article.url}`);
-          continue;
-        }
-
-        const textToEmbed = `${article.title}. ${article.description}`;
-        const embedding = await getEmbedding(textToEmbed);
-
-        // Check if the embedding call failed or returned an error object
-        if (!embedding) {
-          console.warn(`Could not get embedding for: ${article.title}. Skipping.`);
-          continue;
-        }
-
-        const query = `
-          INSERT INTO articles 
-            (title, description, article_url, image_url, source_name, published_at, embedding)
-          VALUES 
-            ($1, $2, $3, $4, $5, $6, $7)
-          ON CONFLICT (article_url) DO NOTHING;
-        `;
-        
-        const embeddingString = `[${embedding.join(',')}]`; 
-
-        const values = [
-          article.title,
-          article.description,
-          article.url,
-          article.image,
-          article.source.name,
-          article.publishedAt,
-          embeddingString,
-        ];
-
-        const insertResult = await client.query(query, values);
-        if (insertResult.rowCount > 0) {
-          categoryProcessedCount++;
-        }
+      // --- Filter: must meet minimum quality bar ---
+      if ((points || 0) < MIN_POINTS) {
+        skippedCount++;
+        continue;
       }
-      console.log(`Saved ${categoryProcessedCount} new articles for ${category}.`);
-      totalProcessedCount += categoryProcessedCount;
 
-      // Wait 2 seconds before fetching the next category to avoid rate limit
-      if (category !== CATEGORIES[CATEGORIES.length - 1]) {
-         console.log('Waiting 2 seconds to respect GNews rate limit...');
-         await sleep(2000); 
+      // Build the HN comments page link as the source
+      const hnCommentsUrl = `https://news.ycombinator.com/item?id=${objectID}`;
+
+      // Use story_text (for self-posts) or fall back to the title as description
+      const description = story_text
+        ? cheerio.load(story_text).text().substring(0, 500).trim()
+        : `${points} points · ${hit.num_comments ?? 0} comments on Hacker News`;
+
+      const sourceName = 'Hacker News';
+      const publishedAt = created_at;
+
+      console.log(`📰 Processing: "${title.substring(0, 60)}..."`);
+
+      // 3. Scrape OpenGraph image (best-effort, non-blocking)
+      const imageUrl = await getOgImage(url);
+      console.log(`   🖼️  Image: ${imageUrl ? '✅ Found' : '❌ None'}`);
+
+      // 4. Get vector embedding (title + description gives best signal)
+      const textToEmbed = `${title}. ${description}`;
+      const embedding = await getEmbedding(textToEmbed);
+      if (!embedding) {
+        console.warn(`   ⚠️  Skipping (embedding failed): "${title.substring(0, 40)}"`);
+        skippedCount++;
+        continue;
       }
+
+      // 5. Upsert into the articles table
+      const embeddingString = `[${embedding.join(',')}]`;
+      const query = `
+        INSERT INTO articles
+          (title, description, article_url, image_url, source_name, published_at, embedding)
+        VALUES
+          ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (article_url) DO NOTHING;
+      `;
+      const values = [
+        title,
+        description,
+        url,          // Link to the actual article
+        imageUrl,     // Can be null — the UI handles this gracefully
+        sourceName,
+        publishedAt,
+        embeddingString,
+      ];
+
+      const result = await client.query(query, values);
+      if (result.rowCount > 0) {
+        savedCount++;
+        console.log(`   ✅ Saved.`);
+      } else {
+        console.log(`   ⏭️  Already exists, skipped.`);
+      }
+
+      // Small delay between articles to be a polite scraper
+      await sleep(500);
     }
-  } catch (err) {
-    console.error('Error during ingestion process:', err.message);
   } finally {
-    if (client) {
-        client.release();
-        console.log('\nReleased DB client.');
-    }
+    client.release();
+    await pool.end();
   }
 
   console.log(`\n--- Ingestion Complete ---`);
-  console.log(`Processed and saved ${totalProcessedCount} new articles to the database.`);
+  console.log(`✅ Saved: ${savedCount} new articles`);
+  console.log(`⏭️  Skipped: ${skippedCount} articles (low quality, no URL, or embed failure)`);
+}
 
-  await pool.end();
-};
-
-// Run the function
 ingestArticles();
