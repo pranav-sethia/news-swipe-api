@@ -106,6 +106,35 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
+// POST /auth/guest — returns a token for the shared guest account
+app.post('/auth/guest', async (req, res) => {
+  const GUEST_EMAIL = 'guest@hackerswipe.io';
+  const GUEST_PASSWORD = process.env.GUEST_PASSWORD || 'guestpass_hackerswipe_2025';
+  try {
+    // Ensure guest account exists
+    const existing = await pool.query('SELECT * FROM users WHERE email = $1', [GUEST_EMAIL]);
+    let user = existing.rows[0];
+    if (!user) {
+      const salt = await bcrypt.genSalt(10);
+      const hash = await bcrypt.hash(GUEST_PASSWORD, salt);
+      const { rows } = await pool.query(
+        'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING *',
+        [GUEST_EMAIL, hash]
+      );
+      user = rows[0];
+      console.log('✅ Guest account created.');
+    }
+    const payload = { user: { id: user.id, email: user.email, isGuest: true } };
+    jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '24h' }, (err, token) => {
+      if (err) throw err;
+      res.json({ token });
+    });
+  } catch (err) {
+    console.error('Error creating guest session:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // --- APP ENDPOINTS (Protected) ---
 app.use('/api', authMiddleware);
 
@@ -194,13 +223,31 @@ app.post('/api/swipe', async (req, res) => {
     return res.status(400).json({ error: 'Missing articleId or liked status' });
   }
   try {
-    const query = 'INSERT INTO user_swipes (user_id, article_id, liked) VALUES ($1, $2, $3) RETURNING *';
-    const values = [userId, articleId, liked];
-    const { rows } = await pool.query(query, values);
+    const query = `
+      INSERT INTO user_swipes (user_id, article_id, liked)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (user_id, article_id) DO UPDATE SET liked = $3, swipe_time = NOW()
+      RETURNING *
+    `;
+    const { rows } = await pool.query(query, [userId, articleId, liked]);
     console.log(`Swipe saved: User ${userId} ${liked ? 'liked' : 'disliked'} Article ${articleId}`);
     res.status(201).json(rows[0]);
   } catch (err) {
     console.error('Error saving swipe:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// DELETE /api/swipe/:articleId — unlike/remove a swipe
+app.delete('/api/swipe/:articleId', async (req, res) => {
+  const userId = req.user.id;
+  const { articleId } = req.params;
+  try {
+    await pool.query('DELETE FROM user_swipes WHERE user_id = $1 AND article_id = $2', [userId, articleId]);
+    console.log(`Swipe deleted: User ${userId} un-liked Article ${articleId}`);
+    res.status(200).json({ message: 'Swipe removed.' });
+  } catch (err) {
+    console.error('Error deleting swipe:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
