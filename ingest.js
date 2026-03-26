@@ -34,31 +34,61 @@ const pool = new Pool({
 /** Small delay to avoid hammering external services */
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Wake the HF Space if sleeping and confirm it's healthy. Returns true if ready. */
+async function waitForMlService(maxWaitMs = 180_000) {
+  console.log('🔌 Checking ML service health...');
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    try {
+      const resp = await axios.post(
+        GRADIO_PREDICT_URL,
+        { data: ['warmup'] },
+        { headers: { 'Gradio-Api-Client': 'js' }, timeout: 20_000 }
+      );
+      if (resp.data?.data?.[0]?.embedding) {
+        console.log('✅ ML service is ready.\n');
+        return true;
+      }
+    } catch {
+      // still waking
+    }
+    const elapsed = Math.round((Date.now() - start) / 1000);
+    process.stdout.write(`\r   Still waking up... ${elapsed}s elapsed`);
+    await sleep(5000);
+  }
+  console.log('\n❌ ML service did not respond after 3 minutes.');
+  return false;
+}
+
 /**
  * Fetches a vector embedding from the Hugging Face ML service.
+ * Retries up to 2 times on transient errors.
  * @param {string} text
  * @returns {Promise<number[]|null>}
  */
 async function getEmbedding(text) {
   if (!text || text.trim().length === 0) return null;
-  try {
-    const response = await axios.post(
-      GRADIO_PREDICT_URL,
-      { data: [text.substring(0, 2000)] },
-      { headers: { 'Gradio-Api-Client': 'js' } }
-    );
-    const embeddingData = response.data?.data?.[0];
-    if (!embeddingData || embeddingData.error || !embeddingData.embedding) {
-      return null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await axios.post(
+        GRADIO_PREDICT_URL,
+        { data: [text.substring(0, 2000)] },
+        { headers: { 'Gradio-Api-Client': 'js' }, timeout: 30_000 }
+      );
+      const embeddingData = response.data?.data?.[0];
+      if (embeddingData?.embedding) return embeddingData.embedding;
+    } catch (err) {
+      const status = err.response?.status ?? 'Network Error';
+      if (attempt < 2) {
+        await sleep(3000);
+      } else {
+        console.warn(`  ⚠️  Embedding failed after 3 attempts: ${status}`);
+      }
     }
-    return embeddingData.embedding;
-  } catch (err) {
-    console.warn(
-      `  ⚠️  Embedding failed: ${err.response?.status ?? 'Network Error'}`
-    );
-    return null;
   }
+  return null;
 }
+
 
 /**
  * Attempts to scrape the OpenGraph image URL from an article page.
@@ -100,6 +130,13 @@ async function ingestArticles() {
 
   if (!ML_API_URL) {
     console.error('❌ ML_SERVICE_URL is not set. Exiting.');
+    process.exit(1);
+  }
+
+  // Wake HF Space if sleeping (free tier can take up to 3 min to cold-start)
+  const mlReady = await waitForMlService();
+  if (!mlReady) {
+    console.error('❌ ML service unavailable. Run node update_scores.js to refresh stats on existing articles.');
     process.exit(1);
   }
 
