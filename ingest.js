@@ -54,19 +54,27 @@ async function initModels() {
  * Uses local AI to distill article text into a crisp 1-2 sentence summary.
  */
 async function getSummary(text) {
-  if (!text || text.length < 150 || !summarizer) return text;
+  if (!summarizer) return text;
+  
+  if (!text || text.length < 80) return text.trim();
   
   try {
     // T5 models require the 'summarize: ' task prefix
-    const rawText = `summarize: ${text.substring(0, 1500)}`;
+    const rawText = `summarize: ${text.substring(0, 2000)}`;
     const result = await summarizer(rawText, {
-      max_new_tokens: 45,
+      max_new_tokens: 50,
       min_new_tokens: 15,
     });
-    return result[0].summary_text.trim();
+    
+    let summary = result[0].summary_text.trim();
+    // Enforce proper capitalization and punctuation
+    summary = summary.charAt(0).toUpperCase() + summary.slice(1);
+    if (!summary.match(/[.!?]$/)) summary += '.';
+    
+    return summary;
   } catch (err) {
     console.warn(`  ⚠️  Summarization failed: ${err.message}`);
-    return text.substring(0, 300) + '...';
+    return text.substring(0, 200).trim() + '...';
   }
 }
 
@@ -126,18 +134,20 @@ async function getArticleMetadata(url) {
     // Always try to grab paragraph text for the AI summarizer
     let fullText = '';
     const paragraphs = [];
-    $('p').each((i, el) => {
-      const txt = $(el).text().trim();
-      if (txt.length > 50) paragraphs.push(txt);
+    $('p, article, section').find('p').each((i, el) => {
+      const txt = $(el).text().replace(/\s+/g, ' ').trim();
+      // Filter out tiny navigation links, cookie banners, and script warnings
+      const isSubstantial = txt.length > 60 && txt.split(' ').length > 8;
+      const isJunk = txt.toLowerCase().match(/(cookie|javascript|subscribe|newsletter|sign in|log in|copyright|all rights reserved)/);
+      if (isSubstantial && !isJunk) paragraphs.push(txt);
     });
-    if (paragraphs.length > 0) {
-      fullText = paragraphs.slice(0, 5).join(' ');
-    }
+    if (paragraphs.length > 0) fullText = paragraphs.slice(0, 6).join(' ');
     
     // Fallback if no meta tags and no body text
-    if (!description && fullText.length > 0) {
-      description = fullText.substring(0, 500);
-    }
+    if (!description && fullText.length > 0) description = fullText.substring(0, 500);
+
+    if (description) description = description.replace(/\s+/g, ' ').trim();
+    if (fullText) fullText = fullText.replace(/\s+/g, ' ').trim();
 
     return { imageUrl, description, fullText };
   } catch {
@@ -197,15 +207,15 @@ async function ingestArticles() {
       const metadata = await getArticleMetadata(url);
       const imageUrl = metadata.imageUrl;
 
-      // Use story_text (for self-posts), fall back to scraped text
+      // Use story_text (for self-posts), fall back to HIGH QUALITY scraped text first, then meta description
       let rawText = story_text
         ? cheerio.load(story_text).text()
-        : metadata.fullText || metadata.description;
+        : (metadata.fullText && metadata.fullText.length > 100) ? metadata.fullText : metadata.description;
 
       console.log(`📰 Processing: "${title.substring(0, 60)}..."`);
 
       let finalDescription = null;
-      if (rawText && rawText.length > 100) {
+      if (rawText && rawText.length > 80) {
         process.stdout.write(`   ✨ Generating AI summary... `);
         finalDescription = await getSummary(rawText);
         console.log(`Done.`);
