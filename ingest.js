@@ -43,9 +43,9 @@ async function initModels() {
     console.log('✅ Local ML embedder loaded.');
   }
   if (!summarizer) {
-    console.log('🧠 Loading local AI summarizer (Xenova/distilbart-cnn-6-6) ...');
-    // Quantized distilbart generates perfect 1-sentence abstractive summaries natively
-    summarizer = await pipeline('summarization', 'Xenova/distilbart-cnn-6-6', { quantized: true });
+    console.log('🧠 Loading local AI summarizer (Xenova/t5-small) ...');
+    // Quantized t5-small is only ~60MB and very fast natively
+    summarizer = await pipeline('summarization', 'Xenova/t5-small', { quantized: true });
     console.log('✅ Local AI summarizer loaded.\n');
   }
 }
@@ -57,8 +57,8 @@ async function getSummary(text) {
   if (!text || text.length < 150 || !summarizer) return text;
   
   try {
-    // Distilbart handles ~1500 chars well.
-    const rawText = text.substring(0, 1500);
+    // T5 models require the 'summarize: ' task prefix
+    const rawText = `summarize: ${text.substring(0, 1500)}`;
     const result = await summarizer(rawText, {
       max_new_tokens: 45,
       min_new_tokens: 15,
