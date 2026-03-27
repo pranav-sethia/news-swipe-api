@@ -1,0 +1,29 @@
+name: Automated News Ingestion Pipeline
+
+on:
+  schedule:
+    # Run every 4 hours (e.g., 00:00, 04:00, 08:00, etc.)
+    - cron: '0 */4 * * *'
+  workflow_dispatch: # Allows manual trigger from the GitHub UI
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      # The local Xenova models (t5-small and all-MiniLM-L6-v2) will be downloaded and cached by the runner during this step.
+      - name: Run Web Scraper & Local AI Summarization Pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: node ingest.js
