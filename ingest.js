@@ -54,16 +54,19 @@ async function initModels() {
  * Uses local AI to distill article text into a crisp 1-2 sentence summary.
  */
 async function getSummary(text) {
-  if (!summarizer) return text;
+  if (!summarizer) return text.substring(0, 200);
   
-  if (!text || text.length < 80) return text.trim();
+  if (!text || text.length < 60) return text.trim();
   
   try {
     // T5 models require the 'summarize: ' task prefix
-    const rawText = `summarize: ${text.substring(0, 2000)}`;
+    const rawText = `summarize: ${text.substring(0, 2500)}`;
     const result = await summarizer(rawText, {
-      max_new_tokens: 50,
+      max_new_tokens: 90,
       min_new_tokens: 15,
+      repetition_penalty: 1.5,
+      no_repeat_ngram_size: 2,
+      num_beams: 3,
     });
     
     let summary = result[0].summary_text.trim();
@@ -74,7 +77,7 @@ async function getSummary(text) {
     return summary;
   } catch (err) {
     console.warn(`  ⚠️  Summarization failed: ${err.message}`);
-    return text.substring(0, 200).trim() + '...';
+    return text.substring(0, 150).trim() + '...';
   }
 }
 
@@ -134,7 +137,7 @@ async function getArticleMetadata(url) {
     // Always try to grab paragraph text for the AI summarizer
     let fullText = '';
     const paragraphs = [];
-    $('p, article, section').find('p').each((i, el) => {
+    $('p').each((i, el) => {
       const txt = $(el).text().replace(/\s+/g, ' ').trim();
       // Filter out tiny navigation links, cookie banners, and script warnings
       const isSubstantial = txt.length > 60 && txt.split(' ').length > 8;
@@ -207,20 +210,26 @@ async function ingestArticles() {
       const metadata = await getArticleMetadata(url);
       const imageUrl = metadata.imageUrl;
 
-      // Use story_text (for self-posts), fall back to HIGH QUALITY scraped text first, then meta description
-      let rawText = story_text
-        ? cheerio.load(story_text).text()
-        : (metadata.fullText && metadata.fullText.length > 100) ? metadata.fullText : metadata.description;
+      // Gather whatever text we can find to feed the AI
+      let rawText = '';
+      if (story_text) rawText = cheerio.load(story_text).text();
+      else if (metadata.fullText && metadata.fullText.length > 80) rawText = metadata.fullText;
+      else if (metadata.description) rawText = metadata.description;
+
+      rawText = rawText.replace(/\s+/g, ' ').trim();
 
       console.log(`📰 Processing: "${title.substring(0, 60)}..."`);
 
       let finalDescription = null;
-      if (rawText && rawText.length > 80) {
+      if (rawText.length > 60) {
         process.stdout.write(`   ✨ Generating AI summary... `);
         finalDescription = await getSummary(rawText);
         console.log(`Done.`);
+      } else if (rawText.length > 0) {
+        // Short enough to act as a summary natively
+        finalDescription = rawText;
       } else {
-        finalDescription = metadata.description || `${points} points · ${hit.num_comments ?? 0} comments on Hacker News`;
+        finalDescription = `${points} points · ${hit.num_comments ?? 0} comments on Hacker News`;
       }
 
       const sourceName = 'Hacker News';
