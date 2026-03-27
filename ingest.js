@@ -67,17 +67,17 @@ async function getEmbedding(text) {
 
 
 /**
- * Attempts to scrape the OpenGraph image URL from an article page.
- * Returns null if the page is unreachable, too slow, or has no og:image tag.
+ * Attempts to scrape the OpenGraph metadata (image and description) from an article page.
+ * Returns null properties if the page is unreachable or missing tags.
  * @param {string} url
- * @returns {Promise<string|null>}
+ * @returns {Promise<{imageUrl: string|null, description: string|null}>}
  */
-async function getOgImage(url) {
+async function getArticleMetadata(url) {
   try {
     const response = await axios.get(url, {
       timeout: OG_FETCH_TIMEOUT_MS,
-      // Only download the first 50 KB — enough to find the <head> tags
-      maxContentLength: 50_000,
+      // Download up to 500KB to ensure we hit the <body> tags for paragraph extraction
+      maxContentLength: 500_000,
       responseType: 'text',
       headers: {
         // Pretend to be a normal browser so sites don't block us
@@ -87,14 +87,38 @@ async function getOgImage(url) {
       },
     });
     const $ = cheerio.load(response.data);
-    const ogImage =
+    const imageUrl =
       $('meta[property="og:image"]').attr('content') ||
       $('meta[name="twitter:image"]').attr('content') ||
       null;
-    return ogImage || null;
+
+    let description =
+      $('meta[property="og:description"]').attr('content') ||
+      $('meta[name="twitter:description"]').attr('content') ||
+      $('meta[name="description"]').attr('content') ||
+      null;
+
+    // Fallback: If no meta tags, grab the first few realistic <p> tags
+    if (!description) {
+      const paragraphs = [];
+      $('p').each((i, el) => {
+        const text = $(el).text().trim();
+        // Ignore tiny UI labels/nav items
+        if (text.length > 50) paragraphs.push(text);
+      });
+      if (paragraphs.length > 0) {
+        description = paragraphs.slice(0, 3).join(' ').substring(0, 500);
+      }
+    }
+
+    if (description) {
+      description = description.replace(/\s+/g, ' ').trim();
+    }
+
+    return { imageUrl, description };
   } catch {
-    // Silently return null — many HN links will timeout or block scrapers
-    return null;
+    // Silently return nulls — many HN links will timeout or block scrapers
+    return { imageUrl: null, description: null };
   }
 }
 
@@ -145,19 +169,29 @@ async function ingestArticles() {
       // Build the HN comments page link as the source
       const hnCommentsUrl = `https://news.ycombinator.com/item?id=${objectID}`;
 
-      // Use story_text (for self-posts) or fall back to the title as description
-      const description = story_text
+      // 3. Scrape OpenGraph image and description (best-effort, non-blocking)
+      const metadata = await getArticleMetadata(url);
+      const imageUrl = metadata.imageUrl;
+
+      // Use story_text (for self-posts), fall back to scraped meta description
+      let description = story_text
         ? cheerio.load(story_text).text().substring(0, 500).trim()
-        : `${points} points · ${hit.num_comments ?? 0} comments on Hacker News`;
+        : null;
+
+      if (!description && metadata.description) {
+        description = metadata.description.substring(0, 500).trim();
+      }
+
+      // Absolute fallback if no description is available at all
+      if (!description) {
+        description = `${points} points · ${hit.num_comments ?? 0} comments on Hacker News`;
+      }
 
       const sourceName = 'Hacker News';
       const publishedAt = created_at;
 
       console.log(`📰 Processing: "${title.substring(0, 60)}..."`);
-
-      // 3. Scrape OpenGraph image (best-effort, non-blocking)
-      const imageUrl = await getOgImage(url);
-      console.log(`   🖼️  Image: ${imageUrl ? '✅ Found' : '❌ None'}`);
+      console.log(`   🖼️  Image: ${imageUrl ? '✅ Found' : '❌ None'} | 📝 Desc: ${metadata.description ? '✅ Found' : '❌ None'}`);
 
       // 4. Get vector embedding (title + description gives best signal)
       const textToEmbed = `${title}. ${description}`;
