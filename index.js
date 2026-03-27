@@ -23,23 +23,33 @@ app.use(cors({ origin: allowedOrigin }));
 app.use(express.json());
 
 
-// --- HELPER FUNCTION: Average multiple vectors ---
-function averageVectors(vectorStrings) {
-  if (vectorStrings.length === 0) return null;
-  const vectors = vectorStrings.map((v) => JSON.parse(v));
-  const vectorLength = vectors[0].length;
-  const numVectors = vectors.length;
-  const averageVector = new Array(vectorLength).fill(0);
+// --- HELPER FUNCTION: Compute Rocchio Vector (Information Retrieval) ---
+function computeRocchioVector(likedStrings, dislikedStrings, alpha = 1.0, beta = 0.5) {
+  if (likedStrings.length === 0) return null;
+  const vectorLength = JSON.parse(likedStrings[0]).length; // 384 for all-MiniLM-L6-v2
+  const result = new Array(vectorLength).fill(0);
 
-  for (const vector of vectors) {
-    for (let i = 0; i < vectorLength; i++) {
-      averageVector[i] += vector[i];
-    }
+  // Positive feedback routing
+  if (likedStrings.length > 0) {
+    const avgLiked = new Array(vectorLength).fill(0);
+    likedStrings.forEach(str => {
+      const v = JSON.parse(str);
+      for(let i=0; i<vectorLength; i++) avgLiked[i] += v[i];
+    });
+    for(let i=0; i<vectorLength; i++) result[i] += alpha * (avgLiked[i] / likedStrings.length);
   }
-  for (let i = 0; i < vectorLength; i++) {
-    averageVector[i] /= numVectors;
+
+  // Negative feedback routing
+  if (dislikedStrings.length > 0) {
+    const avgDisliked = new Array(vectorLength).fill(0);
+    dislikedStrings.forEach(str => {
+      const v = JSON.parse(str);
+      for(let i=0; i<vectorLength; i++) avgDisliked[i] += v[i];
+    });
+    for(let i=0; i<vectorLength; i++) result[i] -= beta * (avgDisliked[i] / dislikedStrings.length);
   }
-  return JSON.stringify(averageVector);
+
+  return JSON.stringify(result);
 }
 
 // --- HELPER FUNCTION: Shuffle an array ---
@@ -141,12 +151,14 @@ app.use('/api', authMiddleware);
 // GET /api/feed (The "V4 SMART 7+3 Blend" Endpoint)
 app.get('/api/feed', async (req, res) => {
   const userId = req.user.id;
-  const TASTE_PROFILE_SIZE = 3;
+  // Define how many recent articles we look at to build the Rocchio profile
+  const PROFILE_SIZE = 5;
   const SMART_FEED_SIZE = 7;
   const DUMB_FEED_SIZE = 3;
 
   try {
-    const tasteQuery = `
+    // Fetch Positive Signal (Likes)
+    const likedQuery = `
       SELECT a.embedding 
       FROM articles a
       JOIN user_swipes us ON a.id = us.article_id
@@ -154,17 +166,32 @@ app.get('/api/feed', async (req, res) => {
       ORDER BY us.swipe_time DESC
       LIMIT $2;
     `;
-    const tasteResult = await pool.query(tasteQuery, [userId, TASTE_PROFILE_SIZE]);
+    // Fetch Negative Signal (Skips/Dislikes)
+    const dislikedQuery = `
+      SELECT a.embedding 
+      FROM articles a
+      JOIN user_swipes us ON a.id = us.article_id
+      WHERE us.user_id = $1 AND us.liked = false
+      ORDER BY us.swipe_time DESC
+      LIMIT $2;
+    `;
+    
+    const [likedResult, dislikedResult] = await Promise.all([
+      pool.query(likedQuery, [userId, PROFILE_SIZE]),
+      pool.query(dislikedQuery, [userId, PROFILE_SIZE])
+    ]);
 
     let finalFeed = [];
     let queryParams = [userId]; // $1 is always userId
 
-    if (tasteResult.rows.length > 0) {
-      // --- "7+3" BLENDED FEED ---
-      console.log(`Using SMART 7+3 feed for user ${userId}`);
-      const likedVectorStrings = tasteResult.rows.map(row => row.embedding);
-      const tasteVector = averageVectors(likedVectorStrings);
-      queryParams.push(tasteVector); // $2 is the tasteVector
+    if (likedResult.rows.length > 0) {
+      // --- "7+3" ROCCHIO BLENDED FEED ---
+      console.log(`Using SMART 7+3 Rocchio feed for user ${userId}`);
+      const likedStrings = likedResult.rows.map(row => row.embedding);
+      const dislikedStrings = dislikedResult.rows.map(row => row.embedding);
+      
+      const tasteVector = computeRocchioVector(likedStrings, dislikedStrings, 1.0, 0.5);
+      queryParams.push(tasteVector); // $2 is the highly personalized Rocchio taste vector
       
       // 1. Get 7 SMART articles
       const smartQuery = `
