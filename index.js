@@ -23,35 +23,6 @@ app.use(cors({ origin: allowedOrigin }));
 app.use(express.json());
 
 
-// --- HELPER FUNCTION: Compute Rocchio Vector (Information Retrieval) ---
-function computeRocchioVector(likedStrings, dislikedStrings, alpha = 1.0, beta = 0.5) {
-  if (likedStrings.length === 0) return null;
-  const vectorLength = JSON.parse(likedStrings[0]).length; // 384 for all-MiniLM-L6-v2
-  const result = new Array(vectorLength).fill(0);
-
-  // Positive feedback routing
-  if (likedStrings.length > 0) {
-    const avgLiked = new Array(vectorLength).fill(0);
-    likedStrings.forEach(str => {
-      const v = JSON.parse(str);
-      for(let i=0; i<vectorLength; i++) avgLiked[i] += v[i];
-    });
-    for(let i=0; i<vectorLength; i++) result[i] += alpha * (avgLiked[i] / likedStrings.length);
-  }
-
-  // Negative feedback routing
-  if (dislikedStrings.length > 0) {
-    const avgDisliked = new Array(vectorLength).fill(0);
-    dislikedStrings.forEach(str => {
-      const v = JSON.parse(str);
-      for(let i=0; i<vectorLength; i++) avgDisliked[i] += v[i];
-    });
-    for(let i=0; i<vectorLength; i++) result[i] -= beta * (avgDisliked[i] / dislikedStrings.length);
-  }
-
-  return JSON.stringify(result);
-}
-
 // --- HELPER FUNCTION: Shuffle an array ---
 function shuffleArray(array) {
   for (let i = array.length - 1; i > 0; i--) {
@@ -148,69 +119,65 @@ app.post('/auth/guest', async (req, res) => {
 // --- APP ENDPOINTS (Protected) ---
 app.use('/api', authMiddleware);
 
-// GET /api/feed (The "V4 SMART 7+3 Blend" Endpoint)
+// GET /api/feed (The "V5 SMART k-NN Blend" Endpoint)
 app.get('/api/feed', async (req, res) => {
   const userId = req.user.id;
-  // Define how many recent articles we look at to build the Rocchio profile
-  const PROFILE_SIZE = 5;
+  // Evaluate the user's latest 5 distinct liked articles
+  const LIKES_TO_EVALUATE = 5;
   const SMART_FEED_SIZE = 7;
   const DUMB_FEED_SIZE = 3;
 
   try {
-    // Fetch Positive Signal (Likes)
-    const likedQuery = `
-      SELECT a.embedding 
-      FROM articles a
-      JOIN user_swipes us ON a.id = us.article_id
-      WHERE us.user_id = $1 AND us.liked = true
-      ORDER BY us.swipe_time DESC
-      LIMIT $2;
-    `;
-    // Fetch Negative Signal (Skips/Dislikes)
-    const dislikedQuery = `
-      SELECT a.embedding 
-      FROM articles a
-      JOIN user_swipes us ON a.id = us.article_id
-      WHERE us.user_id = $1 AND us.liked = false
-      ORDER BY us.swipe_time DESC
-      LIMIT $2;
-    `;
-    
-    const [likedResult, dislikedResult] = await Promise.all([
-      pool.query(likedQuery, [userId, PROFILE_SIZE]),
-      pool.query(dislikedQuery, [userId, PROFILE_SIZE])
-    ]);
+    // Check if user has ANY likes to activate the Recommendation Engine
+    const likeCheck = await pool.query('SELECT 1 FROM user_swipes WHERE user_id = $1 AND liked = true LIMIT 1', [userId]);
 
     let finalFeed = [];
-    let queryParams = [userId]; // $1 is always userId
 
-    if (likedResult.rows.length > 0) {
-      // --- "7+3" ROCCHIO BLENDED FEED ---
-      console.log(`Using SMART 7+3 Rocchio feed for user ${userId}`);
-      const likedStrings = likedResult.rows.map(row => row.embedding);
-      const dislikedStrings = dislikedResult.rows.map(row => row.embedding);
+    if (likeCheck.rows.length > 0) {
+      console.log(`Using MULTI-MODAL k-NN feed for user ${userId}`);
       
-      const tasteVector = computeRocchioVector(likedStrings, dislikedStrings, 1.0, 0.5);
-      queryParams.push(tasteVector); // $2 is the highly personalized Rocchio taste vector
-      
-      // 1. Get 7 SMART articles
+      // 1. Get 7 SMART articles using a k-Nearest Neighbors projection against ANY of the recent 5 likes
       const smartQuery = `
-        SELECT id, title, description, article_url, image_url, source_name, published_at, score, num_comments, hn_id, (1 - (embedding <=> $2)) as similarity
-        FROM articles
-        WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1)
-        ORDER BY similarity DESC
-        LIMIT ${SMART_FEED_SIZE};
+        SELECT a.id, a.title, a.description, a.article_url, a.image_url, a.source_name, a.published_at, a.score, a.num_comments, a.hn_id,
+          (
+            SELECT MAX(1 - (a.embedding <=> liked_a.embedding))
+            FROM (
+              SELECT article_id 
+              FROM user_swipes 
+              WHERE user_id = $1 AND liked = true 
+              ORDER BY swipe_time DESC 
+              LIMIT $2
+            ) recent_likes
+            JOIN articles liked_a ON recent_likes.article_id = liked_a.id
+          ) as similarity
+        FROM articles a
+        WHERE a.id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1)
+        ORDER BY similarity DESC NULLS LAST
+        LIMIT $3;
       `;
-      const smartRows = (await pool.query(smartQuery, queryParams)).rows;
+      const smartRows = (await pool.query(smartQuery, [userId, LIKES_TO_EVALUATE, SMART_FEED_SIZE])).rows;
+      
+      // Normalize similarity scores to a human-friendly 70-99% range using min-max scaling
+      const rawScores = smartRows.map(r => parseFloat(r.similarity)).filter(s => !isNaN(s));
+      const minS = Math.min(...rawScores);
+      const maxS = Math.max(...rawScores);
+      const range = maxS - minS || 1; // avoid div by 0
+      smartRows.forEach(r => {
+        if (r.similarity != null) {
+          const normalized = (parseFloat(r.similarity) - minS) / range; // 0..1
+          r.match_pct = Math.round(70 + normalized * 29); // scale to 70-99
+        }
+      });
+      
       finalFeed.push(...smartRows);
-
 
       // 2. Get 3 DUMB articles for exploration
       const smartArticleIds = smartRows.map(a => a.id);
       const idPlaceholders = smartArticleIds.length > 0 ? smartArticleIds.join(',') : '0';
 
       const dumbQuery = `
-        SELECT *, NULL as similarity FROM articles
+        SELECT id, title, description, article_url, image_url, source_name, published_at, score, num_comments, hn_id, NULL as similarity 
+        FROM articles
         WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1)
         AND id NOT IN (${idPlaceholders})
         ORDER BY RANDOM()
@@ -226,12 +193,13 @@ app.get('/api/feed', async (req, res) => {
       // --- 100% "DUMB" FEED (New User) ---
       console.log(`User ${userId} has no likes. Using DUMB feed (random articles)`);
       const dumbQuery = `
-        SELECT * FROM articles
+        SELECT id, title, description, article_url, image_url, source_name, published_at, score, num_comments, hn_id, NULL as similarity 
+        FROM articles
         WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1)
         ORDER BY RANDOM()
         LIMIT 10;
       `;
-      finalFeed = (await pool.query(dumbQuery, queryParams)).rows;
+      finalFeed = (await pool.query(dumbQuery, [userId])).rows;
     }
 
     res.json(finalFeed);

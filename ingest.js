@@ -255,7 +255,10 @@ async function ingestArticles() {
           ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT (article_url) DO UPDATE SET
           score = EXCLUDED.score,
-          num_comments = EXCLUDED.num_comments;
+          num_comments = EXCLUDED.num_comments,
+          embedding = EXCLUDED.embedding,
+          description = EXCLUDED.description,
+          image_url = EXCLUDED.image_url;
       `;
       const values = [
         title,
