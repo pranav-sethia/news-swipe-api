@@ -34,15 +34,39 @@ const pool = new Pool({
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let embedder = null;
+let summarizer = null;
 
-async function initEmbedder() {
+async function initModels() {
   if (!embedder) {
-    console.log('🧠 Loading local ML model (Xenova/all-MiniLM-L6-v2) ...');
-    // quantized: true makes the model ~22MB and much faster to load/run natively
-    embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', {
-      quantized: true,
+    console.log('🧠 Loading local ML embedder (Xenova/all-MiniLM-L6-v2) ...');
+    embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', { quantized: true });
+    console.log('✅ Local ML embedder loaded.');
+  }
+  if (!summarizer) {
+    console.log('🧠 Loading local AI summarizer (Xenova/distilbart-cnn-6-6) ...');
+    // Quantized distilbart generates perfect 1-sentence abstractive summaries natively
+    summarizer = await pipeline('summarization', 'Xenova/distilbart-cnn-6-6', { quantized: true });
+    console.log('✅ Local AI summarizer loaded.\n');
+  }
+}
+
+/**
+ * Uses local AI to distill article text into a crisp 1-2 sentence summary.
+ */
+async function getSummary(text) {
+  if (!text || text.length < 150 || !summarizer) return text;
+  
+  try {
+    // Distilbart handles ~1500 chars well.
+    const rawText = text.substring(0, 1500);
+    const result = await summarizer(rawText, {
+      max_new_tokens: 45,
+      min_new_tokens: 15,
     });
-    console.log('✅ Local ML model loaded.\n');
+    return result[0].summary_text.trim();
+  } catch (err) {
+    console.warn(`  ⚠️  Summarization failed: ${err.message}`);
+    return text.substring(0, 300) + '...';
   }
 }
 
@@ -99,23 +123,23 @@ async function getArticleMetadata(url) {
       null;
 
     // Fallback: If no meta tags, grab the first few realistic <p> tags
-    if (!description) {
-      const paragraphs = [];
-      $('p').each((i, el) => {
-        const text = $(el).text().trim();
-        // Ignore tiny UI labels/nav items
-        if (text.length > 50) paragraphs.push(text);
-      });
-      if (paragraphs.length > 0) {
-        description = paragraphs.slice(0, 3).join(' ').substring(0, 500);
-      }
+    // Always try to grab paragraph text for the AI summarizer
+    let fullText = '';
+    const paragraphs = [];
+    $('p').each((i, el) => {
+      const txt = $(el).text().trim();
+      if (txt.length > 50) paragraphs.push(txt);
+    });
+    if (paragraphs.length > 0) {
+      fullText = paragraphs.slice(0, 5).join(' ');
+    }
+    
+    // Fallback if no meta tags and no body text
+    if (!description && fullText.length > 0) {
+      description = fullText.substring(0, 500);
     }
 
-    if (description) {
-      description = description.replace(/\s+/g, ' ').trim();
-    }
-
-    return { imageUrl, description };
+    return { imageUrl, description, fullText };
   } catch {
     // Silently return nulls — many HN links will timeout or block scrapers
     return { imageUrl: null, description: null };
@@ -128,8 +152,8 @@ async function getArticleMetadata(url) {
 async function ingestArticles() {
   console.log('🚀 Starting Hacker News ingestion pipeline...\n');
 
-  // Initialize local embedding model
-  await initEmbedder();
+  // Initialize local embedding & summarization models
+  await initModels();
 
   // 1. Fetch top HN front page stories from Algolia
   console.log('📡 Fetching Hacker News front page from Algolia...');
@@ -173,28 +197,29 @@ async function ingestArticles() {
       const metadata = await getArticleMetadata(url);
       const imageUrl = metadata.imageUrl;
 
-      // Use story_text (for self-posts), fall back to scraped meta description
-      let description = story_text
-        ? cheerio.load(story_text).text().substring(0, 500).trim()
-        : null;
+      // Use story_text (for self-posts), fall back to scraped text
+      let rawText = story_text
+        ? cheerio.load(story_text).text()
+        : metadata.fullText || metadata.description;
 
-      if (!description && metadata.description) {
-        description = metadata.description.substring(0, 500).trim();
-      }
+      console.log(`📰 Processing: "${title.substring(0, 60)}..."`);
 
-      // Absolute fallback if no description is available at all
-      if (!description) {
-        description = `${points} points · ${hit.num_comments ?? 0} comments on Hacker News`;
+      let finalDescription = null;
+      if (rawText && rawText.length > 100) {
+        process.stdout.write(`   ✨ Generating AI summary... `);
+        finalDescription = await getSummary(rawText);
+        console.log(`Done.`);
+      } else {
+        finalDescription = metadata.description || `${points} points · ${hit.num_comments ?? 0} comments on Hacker News`;
       }
 
       const sourceName = 'Hacker News';
       const publishedAt = created_at;
 
-      console.log(`📰 Processing: "${title.substring(0, 60)}..."`);
-      console.log(`   🖼️  Image: ${imageUrl ? '✅ Found' : '❌ None'} | 📝 Desc: ${metadata.description ? '✅ Found' : '❌ None'}`);
+      console.log(`   🖼️  Image: ${imageUrl ? '✅ Found' : '❌ None'} | 📝 AI Summary: ${finalDescription !== rawText ? '✅ Generated' : '❌ Fallback'}`);
 
-      // 4. Get vector embedding (title + description gives best signal)
-      const textToEmbed = `${title}. ${description}`;
+      // 4. Get vector embedding
+      const textToEmbed = `${title}. ${finalDescription}`;
       const embedding = await getEmbedding(textToEmbed);
       if (!embedding) {
         console.warn(`   ⚠️  Skipping (embedding failed): "${title.substring(0, 40)}"`);
