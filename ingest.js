@@ -4,12 +4,11 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const { Pool } = require('pg');
 
+const { pipeline } = require('@xenova/transformers');
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
-const ML_API_URL = (process.env.ML_SERVICE_URL || '').replace(/\/$/, '');
-const GRADIO_PREDICT_URL = `${ML_API_URL}/api/predict`;
-
 const HN_ALGOLIA_URL =
   'https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=100';
 
@@ -34,59 +33,36 @@ const pool = new Pool({
 /** Small delay to avoid hammering external services */
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Wake the HF Space if sleeping and confirm it's healthy. Returns true if ready. */
-async function waitForMlService(maxWaitMs = 180_000) {
-  console.log('🔌 Checking ML service health...');
-  const start = Date.now();
-  while (Date.now() - start < maxWaitMs) {
-    try {
-      const resp = await axios.post(
-        GRADIO_PREDICT_URL,
-        { data: ['warmup'] },
-        { headers: { 'Gradio-Api-Client': 'js' }, timeout: 20_000 }
-      );
-      if (resp.data?.data?.[0]?.embedding) {
-        console.log('✅ ML service is ready.\n');
-        return true;
-      }
-    } catch {
-      // still waking
-    }
-    const elapsed = Math.round((Date.now() - start) / 1000);
-    process.stdout.write(`\r   Still waking up... ${elapsed}s elapsed`);
-    await sleep(5000);
+let embedder = null;
+
+async function initEmbedder() {
+  if (!embedder) {
+    console.log('🧠 Loading local ML model (Xenova/all-MiniLM-L6-v2) ...');
+    // quantized: true makes the model ~22MB and much faster to load/run natively
+    embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', {
+      quantized: true,
+    });
+    console.log('✅ Local ML model loaded.\n');
   }
-  console.log('\n❌ ML service did not respond after 3 minutes.');
-  return false;
 }
 
 /**
- * Fetches a vector embedding from the Hugging Face ML service.
- * Retries up to 2 times on transient errors.
+ * Generates a vector embedding locally via Xenova.
  * @param {string} text
  * @returns {Promise<number[]|null>}
  */
 async function getEmbedding(text) {
   if (!text || text.trim().length === 0) return null;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const response = await axios.post(
-        GRADIO_PREDICT_URL,
-        { data: [text.substring(0, 2000)] },
-        { headers: { 'Gradio-Api-Client': 'js' }, timeout: 30_000 }
-      );
-      const embeddingData = response.data?.data?.[0];
-      if (embeddingData?.embedding) return embeddingData.embedding;
-    } catch (err) {
-      const status = err.response?.status ?? 'Network Error';
-      if (attempt < 2) {
-        await sleep(3000);
-      } else {
-        console.warn(`  ⚠️  Embedding failed after 3 attempts: ${status}`);
-      }
-    }
+  try {
+    const output = await embedder(text.substring(0, 2000), {
+      pooling: 'mean',
+      normalize: true,
+    });
+    return Array.from(output.data);
+  } catch (err) {
+    console.warn(`  ⚠️  Embedding failed: ${err.message}`);
+    return null;
   }
-  return null;
 }
 
 
@@ -128,17 +104,8 @@ async function getOgImage(url) {
 async function ingestArticles() {
   console.log('🚀 Starting Hacker News ingestion pipeline...\n');
 
-  if (!ML_API_URL) {
-    console.error('❌ ML_SERVICE_URL is not set. Exiting.');
-    process.exit(1);
-  }
-
-  // Wake HF Space if sleeping (free tier can take up to 3 min to cold-start)
-  const mlReady = await waitForMlService();
-  if (!mlReady) {
-    console.error('❌ ML service unavailable. Run node update_scores.js to refresh stats on existing articles.');
-    process.exit(1);
-  }
+  // Initialize local embedding model
+  await initEmbedder();
 
   // 1. Fetch top HN front page stories from Algolia
   console.log('📡 Fetching Hacker News front page from Algolia...');
