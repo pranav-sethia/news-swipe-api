@@ -240,7 +240,7 @@ async function ingestArticles() {
       `;
       const values = [
         title,
-        description,
+        finalDescription,
         url,
         imageUrl,
         sourceName,
