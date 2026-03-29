@@ -5,7 +5,7 @@ const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const authMiddleware = require('./authMiddleware');
-const { OAuth2Client } = require('google-auth-library');
+const axios = require('axios');
 
 const app = express();
 const port = process.env.PORT || 4000;
@@ -117,19 +117,18 @@ app.post('/auth/guest', async (req, res) => {
   }
 });
 
-// POST /api/auth/google — verifies Google token and issues app JWT
+// POST /api/auth/google — verifies Google access_token and issues app JWT
 app.post('/api/auth/google', async (req, res) => {
-  const { credential } = req.body;
+  const { credential } = req.body; // In this case, it's an access_token from useGoogleLogin
   if (!credential) return res.status(400).json({ error: 'Missing credential' });
 
-  const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
   try {
-    const ticket = await client.verifyIdToken({
-      idToken: credential,
-      audience: process.env.GOOGLE_CLIENT_ID,
+    // Ping Google to verify token and get user profile
+    const { data: googleUser } = await axios.get('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${credential}` }
     });
-    const payload = ticket.getPayload();
-    const email = payload.email;
+    
+    const email = googleUser.email;
     if (!email) throw new Error('No email found in Google token');
 
     // Check if user exists
