@@ -5,6 +5,7 @@ const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const authMiddleware = require('./authMiddleware');
+const { OAuth2Client } = require('google-auth-library');
 
 const app = express();
 const port = process.env.PORT || 4000;
@@ -113,6 +114,50 @@ app.post('/auth/guest', async (req, res) => {
   } catch (err) {
     console.error('Error creating guest session:', err);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /api/auth/google — verifies Google token and issues app JWT
+app.post('/api/auth/google', async (req, res) => {
+  const { credential } = req.body;
+  if (!credential) return res.status(400).json({ error: 'Missing credential' });
+
+  const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+  try {
+    const ticket = await client.verifyIdToken({
+      idToken: credential,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+    const email = payload.email;
+    if (!email) throw new Error('No email found in Google token');
+
+    // Check if user exists
+    let { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    let user = rows[0];
+
+    // If no user, create one securely with a random unguessable password hash
+    if (!user) {
+      const dummyPassword = 'GOOGLE_SSO_' + Array.from({length: 32}, () => Math.random().toString(36).charAt(2)).join('');
+      const salt = await bcrypt.genSalt(10);
+      const hash = await bcrypt.hash(dummyPassword, salt);
+      const inserted = await pool.query(
+        'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING *',
+        [email, hash]
+      );
+      user = inserted.rows[0];
+      console.log(`✅ Google SSO account created for ${email}`);
+    }
+
+    // Issue standard JWT
+    const jwtPayload = { user: { id: user.id, email: user.email } };
+    jwt.sign(jwtPayload, process.env.JWT_SECRET, { expiresIn: '7d' }, (err, token) => {
+      if (err) throw err;
+      res.json({ token, user: { id: user.id, email: user.email } });
+    });
+  } catch (err) {
+    console.error('Google Auth verification failed:', err);
+    res.status(401).json({ error: 'Invalid Google Token' });
   }
 });
 
