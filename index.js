@@ -23,6 +23,9 @@ const allowedOrigin = process.env.FRONTEND_URL;
 app.use(cors({ origin: allowedOrigin }));
 app.use(express.json());
 
+// --- Health Check (Keep-Alive) ---
+app.get('/api/health', (req, res) => res.status(200).send('OK'));
+
 
 // --- HELPER FUNCTION: Shuffle an array ---
 function shuffleArray(array) {
