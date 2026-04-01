@@ -196,7 +196,7 @@ app.get('/api/feed', async (req, res) => {
               LIMIT $2
             ) recent_likes
             JOIN articles liked_a ON recent_likes.article_id = liked_a.id
-          ) as similarity
+          ) - (COALESCE(EXTRACT(EPOCH FROM (NOW() - a.published_at::timestamp)), 0) / 86400.0 * 0.005) as similarity
         FROM articles a
         WHERE a.id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1)
         ORDER BY similarity DESC NULLS LAST
@@ -227,6 +227,7 @@ app.get('/api/feed', async (req, res) => {
         FROM articles
         WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1)
         AND id NOT IN (${idPlaceholders})
+        AND published_at::timestamp > NOW() - INTERVAL '14 days'
         ORDER BY RANDOM()
         LIMIT ${DUMB_FEED_SIZE};
       `;
@@ -243,6 +244,7 @@ app.get('/api/feed', async (req, res) => {
         SELECT id, title, description, article_url, image_url, source_name, published_at, score, num_comments, hn_id, NULL as similarity 
         FROM articles
         WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1)
+        AND published_at::timestamp > NOW() - INTERVAL '14 days'
         ORDER BY RANDOM()
         LIMIT 10;
       `;
