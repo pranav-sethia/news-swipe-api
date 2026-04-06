@@ -222,7 +222,7 @@ app.get('/api/feed', async (req, res) => {
                (1 - (embedding <=> $1))::float AS similarity_raw
         FROM articles
         WHERE embedding IS NOT NULL
-          AND id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $2)
+          AND id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $2 AND article_id IS NOT NULL)
         ORDER BY embedding <=> $1
         LIMIT $3
       `, [tasteVector, userId, SMART_FETCH])).rows;
@@ -250,7 +250,7 @@ app.get('/api/feed', async (req, res) => {
         SELECT id, title, description, article_url, image_url, source_name, published_at,
                score, num_comments, hn_id, NULL::float AS similarity_raw
         FROM articles
-        WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1)
+        WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1 AND article_id IS NOT NULL)
           AND id NOT IN (${idBlock})
           AND embedding IS NOT NULL
           AND published_at::timestamp > NOW() - INTERVAL '14 days'
@@ -268,7 +268,7 @@ app.get('/api/feed', async (req, res) => {
         SELECT id, title, description, article_url, image_url, source_name, published_at,
                score, num_comments, hn_id, NULL::float AS similarity_raw
         FROM articles
-        WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1)
+        WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1 AND article_id IS NOT NULL)
           AND embedding IS NOT NULL
           AND published_at::timestamp > NOW() - INTERVAL '14 days'
         ORDER BY RANDOM()
