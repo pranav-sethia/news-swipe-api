@@ -165,14 +165,15 @@ app.post('/api/auth/google', async (req, res) => {
 // --- APP ENDPOINTS (Protected) ---
 app.use('/api', authMiddleware);
 
-// GET /api/feed (The "V6 EMA k-NN Blend" Endpoint)
+// GET /api/feed (The "V7 EMA k-NN" Endpoint)
 app.get('/api/feed', async (req, res) => {
   const userId = req.user.id;
-  const SMART_FEED_SIZE = 7;
+  const SMART_FEED_SIZE = 12;
   const DUMB_FEED_SIZE = 3;
+  // Minimum similarity to be labelled a "Match" — below this is shown as Discovery
+  const MIN_MATCH_THRESHOLD = 0.12;
 
   try {
-    // Use the new EMA taste_vector to get recommendations
     const userResult = await pool.query('SELECT taste_vector FROM users WHERE id = $1', [userId]);
     const tasteVector = userResult.rows[0]?.taste_vector;
 
@@ -181,36 +182,47 @@ app.get('/api/feed', async (req, res) => {
     if (tasteVector) {
       console.log(`Using EMA taste_vector feed for user ${userId}`);
       
-      // 1. Get 7 SMART articles using a simple k-Nearest Neighbors projection against the user vector
+      // 1. Get SMART articles ordered by closeness to the user's taste vector.
+      //    Exclude ALL articles the user has already swiped on (both liked and disliked)
+      //    so left-swiped articles never reappear.
+      //    No date cap — ensures matches never run dry.
       const smartQuery = `
         SELECT id, title, description, article_url, image_url, source_name, published_at, score, num_comments, hn_id,
           1 - (embedding <=> $1) as similarity_raw
         FROM articles
-        WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $2)
+        WHERE id NOT IN (
+          SELECT article_id FROM user_swipes WHERE user_id = $2
+        )
         ORDER BY embedding <=> $1
         LIMIT $3;
       `;
       const smartRows = (await pool.query(smartQuery, [tasteVector, userId, SMART_FEED_SIZE])).rows;
       
-      // Generate honest Match % badges using strict boundaries instead of min-max scaling
-      smartRows.forEach(r => {
-        if (r.similarity_raw != null) {
-          let score = parseFloat(r.similarity_raw);
-          // all-MiniLM-L6-v2 semantic boundaries: >0.35 is great, <0.10 is poor.
-          if (score > 0.35) score = 0.35;
-          if (score < 0.10) score = 0.10;
-          
-          const boundedNorm = (score - 0.10) / (0.35 - 0.10); // 0.0 to 1.0
-          r.match_pct = Math.round(70 + (boundedNorm * 29)); // Maps strictly to 70% - 99%
-        }
-      });
+      // Compute match % using batch min/max for good spread, but:
+      // - Only articles above MIN_MATCH_THRESHOLD get a % badge (genuine matches)
+      // - The normalized range always spans the full 70-99 band within the real batch scores
+      const qualityRows = smartRows.filter(r => parseFloat(r.similarity_raw) >= MIN_MATCH_THRESHOLD);
+      if (qualityRows.length > 0) {
+        const scores = qualityRows.map(r => parseFloat(r.similarity_raw));
+        const minS = Math.min(...scores);
+        const maxS = Math.max(...scores);
+        const range = maxS - minS || 0.001; // avoid div-by-zero if all identical
+        smartRows.forEach(r => {
+          const score = parseFloat(r.similarity_raw);
+          if (score >= MIN_MATCH_THRESHOLD) {
+            const norm = (score - minS) / range; // 0.0 to 1.0 within quality band
+            r.match_pct = Math.round(70 + norm * 29); // 70% to 99%
+          } else {
+            r.match_pct = null; // Below threshold — treat as discovery
+          }
+        });
+      }
       
       finalFeed.push(...smartRows);
 
-      // 2. Get 3 DUMB articles for exploration
+      // 2. Get a few random discovery articles for serendipity
       const smartArticleIds = smartRows.map(a => a.id);
       const idPlaceholders = smartArticleIds.length > 0 ? smartArticleIds.join(',') : '0';
-
       const dumbQuery = `
         SELECT id, title, description, article_url, image_url, source_name, published_at, score, num_comments, hn_id, NULL as similarity_raw 
         FROM articles
@@ -223,19 +235,18 @@ app.get('/api/feed', async (req, res) => {
       const dumbRows = (await pool.query(dumbQuery, [userId])).rows;
       finalFeed.push(...dumbRows);
 
-      // 3. Shuffle the 7+3 feed so the dumb articles are mixed in
       finalFeed = shuffleArray(finalFeed);
 
     } else {
-      // --- 100% "DUMB" FEED (New User) ---
-      console.log(`User ${userId} has no taste_vector yet. Using DUMB feed (random articles)`);
+      // New user — 100% random discovery feed
+      console.log(`User ${userId} has no taste_vector yet. Using discovery feed.`);
       const dumbQuery = `
         SELECT id, title, description, article_url, image_url, source_name, published_at, score, num_comments, hn_id, NULL as similarity_raw 
         FROM articles
         WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1)
         AND published_at::timestamp > NOW() - INTERVAL '14 days'
         ORDER BY RANDOM()
-        LIMIT 10;
+        LIMIT 15;
       `;
       finalFeed = (await pool.query(dumbQuery, [userId])).rows;
     }
@@ -247,6 +258,7 @@ app.get('/api/feed', async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
 
 // POST /api/swipe
 app.post('/api/swipe', async (req, res) => {
