@@ -196,11 +196,11 @@ app.get('/api/feed', async (req, res) => {
       smartRows.forEach(r => {
         if (r.similarity_raw != null) {
           let score = parseFloat(r.similarity_raw);
-          // all-MiniLM-L6-v2 semantic boundaries: >0.75 is great, <0.40 is poor.
-          if (score > 0.75) score = 0.75;
-          if (score < 0.40) score = 0.40;
+          // all-MiniLM-L6-v2 semantic boundaries: >0.35 is great, <0.10 is poor.
+          if (score > 0.35) score = 0.35;
+          if (score < 0.10) score = 0.10;
           
-          const boundedNorm = (score - 0.40) / (0.75 - 0.40); // 0.0 to 1.0
+          const boundedNorm = (score - 0.10) / (0.35 - 0.10); // 0.0 to 1.0
           r.match_pct = Math.round(70 + (boundedNorm * 29)); // Maps strictly to 70% - 99%
         }
       });
