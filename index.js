@@ -165,13 +165,13 @@ app.post('/api/auth/google', async (req, res) => {
 // --- APP ENDPOINTS (Protected) ---
 app.use('/api', authMiddleware);
 
-// GET /api/feed (The "V7 EMA k-NN" Endpoint)
+// GET /api/feed (V8 — EMA + Deterministic Interleave)
 app.get('/api/feed', async (req, res) => {
   const userId = req.user.id;
-  const SMART_FEED_SIZE = 12;
-  const DUMB_FEED_SIZE = 3;
-  // Minimum similarity to be labelled a "Match" — below this is shown as Discovery
-  const MIN_MATCH_THRESHOLD = 0.12;
+  // Always fetch enough smart candidates; top SMART_LABELLED will always show a Match badge
+  const SMART_FETCH   = 15;  // pull 15 closest articles from DB
+  const SMART_LABELLED = 9;  // always label the best 9 as MATCH (relative scoring)
+  const DUMB_FETCH     = 3;  // 3 serendipity articles interleaved between matches
 
   try {
     const userResult = await pool.query('SELECT taste_vector FROM users WHERE id = $1', [userId]);
@@ -180,73 +180,86 @@ app.get('/api/feed', async (req, res) => {
     let finalFeed = [];
 
     if (tasteVector) {
-      console.log(`Using EMA taste_vector feed for user ${userId}`);
-      
-      // 1. Get SMART articles ordered by closeness to the user's taste vector.
-      //    Exclude ALL articles the user has already swiped on (both liked and disliked)
-      //    so left-swiped articles never reappear.
-      //    No date cap — ensures matches never run dry.
+      console.log(`[V8] EMA feed for user ${userId}`);
+
+      // 1. Fetch the closest SMART_FETCH articles to the user's taste vector.
+      //    Exclude ALL previously swiped articles (left AND right) so nothing repeats.
       const smartQuery = `
         SELECT id, title, description, article_url, image_url, source_name, published_at, score, num_comments, hn_id,
-          1 - (embedding <=> $1) as similarity_raw
+          (1 - (embedding <=> $1))::float AS similarity_raw
         FROM articles
-        WHERE id NOT IN (
-          SELECT article_id FROM user_swipes WHERE user_id = $2
-        )
+        WHERE embedding IS NOT NULL
+          AND id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $2)
         ORDER BY embedding <=> $1
-        LIMIT $3;
+        LIMIT $3
       `;
-      const smartRows = (await pool.query(smartQuery, [tasteVector, userId, SMART_FEED_SIZE])).rows;
-      
-      // Compute match % using batch min/max for good spread, but:
-      // - Only articles above MIN_MATCH_THRESHOLD get a % badge (genuine matches)
-      // - The normalized range always spans the full 70-99 band within the real batch scores
-      const qualityRows = smartRows.filter(r => parseFloat(r.similarity_raw) >= MIN_MATCH_THRESHOLD);
-      if (qualityRows.length > 0) {
-        const scores = qualityRows.map(r => parseFloat(r.similarity_raw));
-        const minS = Math.min(...scores);
-        const maxS = Math.max(...scores);
-        const range = maxS - minS || 0.001; // avoid div-by-zero if all identical
-        smartRows.forEach(r => {
-          const score = parseFloat(r.similarity_raw);
-          if (score >= MIN_MATCH_THRESHOLD) {
-            const norm = (score - minS) / range; // 0.0 to 1.0 within quality band
-            r.match_pct = Math.round(70 + norm * 29); // 70% to 99%
-          } else {
-            r.match_pct = null; // Below threshold — treat as discovery
-          }
+      const smartRows = (await pool.query(smartQuery, [tasteVector, userId, SMART_FETCH])).rows;
+
+      // 2. Assign Match % to the top SMART_LABELLED results using relative (batch) min-max.
+      //    This guarantees there are ALWAYS match badges after the first like —
+      //    regardless of absolute similarity, the best N articles the DB found ARE the user's matches.
+      const labelled   = smartRows.slice(0, SMART_LABELLED);
+      const unlabelled = smartRows.slice(SMART_LABELLED); // Any extras stay as discovery
+
+      if (labelled.length > 0) {
+        const scores = labelled.map(r => parseFloat(r.similarity_raw));
+        const minS   = Math.min(...scores);
+        const maxS   = Math.max(...scores);
+        const range  = maxS - minS || 0.001; // safe divide
+        labelled.forEach(r => {
+          const norm = (parseFloat(r.similarity_raw) - minS) / range;
+          // Scale 70 – 99, but floor the weakest at 72 so no MATCH shows as exactly 70
+          r.match_pct = Math.round(72 + norm * 27);
         });
       }
-      
-      finalFeed.push(...smartRows);
+      unlabelled.forEach(r => { r.match_pct = null; });
 
-      // 2. Get a few random discovery articles for serendipity
-      const smartArticleIds = smartRows.map(a => a.id);
-      const idPlaceholders = smartArticleIds.length > 0 ? smartArticleIds.join(',') : '0';
+      // The labelled rows come back sorted strongest-first from pgvector;
+      // reverse so weakest is at index 0 (shown LAST by the card stack).
+      labelled.reverse();
+
+      // 3. Fetch discovery (random recent) articles, excluding already-seen and smart batch.
+      const smartIds = smartRows.map(a => a.id);
+      const idBlock  = smartIds.length ? smartIds.join(',') : '0';
       const dumbQuery = `
-        SELECT id, title, description, article_url, image_url, source_name, published_at, score, num_comments, hn_id, NULL as similarity_raw 
+        SELECT id, title, description, article_url, image_url, source_name, published_at, score, num_comments, hn_id, NULL::float AS similarity_raw
         FROM articles
         WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1)
-        AND id NOT IN (${idPlaceholders})
-        AND published_at::timestamp > NOW() - INTERVAL '14 days'
+          AND id NOT IN (${idBlock})
+          AND published_at::timestamp > NOW() - INTERVAL '14 days'
         ORDER BY RANDOM()
-        LIMIT ${DUMB_FEED_SIZE};
+        LIMIT ${DUMB_FETCH}
       `;
       const dumbRows = (await pool.query(dumbQuery, [userId])).rows;
-      finalFeed.push(...dumbRows);
 
-      finalFeed = shuffleArray(finalFeed);
+      // 4. Deterministic interleave: [DISC, MATCH, MATCH, DISC, MATCH, MATCH, DISC, MATCH, MATCH]
+      //    Last element = shown first. Pattern means user starts with MATCH, gets a DISC every 3rd.
+      let mi = 0; // match index (ascending from weakest)
+      let di = 0; // discovery index
+      const interleaved = [];
+      while (mi < labelled.length) {
+        // Insert one discovery card at the bottom of each group (seen last within group)
+        if (di < dumbRows.length) interleaved.push(dumbRows[di++]);
+        // Then push 2 match cards
+        if (mi < labelled.length) interleaved.push(labelled[mi++]);
+        if (mi < labelled.length) interleaved.push(labelled[mi++]);
+      }
+      // Append any leftover unlabelled or discovery cards
+      unlabelled.forEach(r => interleaved.unshift(r)); // Weakest at the very bottom
+      while (di < dumbRows.length) interleaved.push(dumbRows[di++]);
+
+      finalFeed = interleaved;
 
     } else {
-      // New user — 100% random discovery feed
-      console.log(`User ${userId} has no taste_vector yet. Using discovery feed.`);
+      // New user: pure discovery feed
+      console.log(`[V8] First-time user ${userId} — discovery feed`);
       const dumbQuery = `
-        SELECT id, title, description, article_url, image_url, source_name, published_at, score, num_comments, hn_id, NULL as similarity_raw 
+        SELECT id, title, description, article_url, image_url, source_name, published_at, score, num_comments, hn_id, NULL::float AS similarity_raw
         FROM articles
         WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1)
-        AND published_at::timestamp > NOW() - INTERVAL '14 days'
+          AND published_at::timestamp > NOW() - INTERVAL '14 days'
         ORDER BY RANDOM()
-        LIMIT 15;
+        LIMIT 15
       `;
       finalFeed = (await pool.query(dumbQuery, [userId])).rows;
     }
@@ -258,6 +271,7 @@ app.get('/api/feed', async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
 
 
 // POST /api/swipe
@@ -302,7 +316,7 @@ app.post('/api/swipe', async (req, res) => {
         } else {
           // EMA Update
           const userVec = parseVector(taste_vector);
-          const alpha = 0.1;
+          const alpha = 0.2; // Fast enough to adapt in 5-10 swipes, stable enough long-term
           const newVec = userVec.map((val, i) => (val * (1 - alpha)) + (articleVec[i] * alpha));
           newVectorStr = `[${newVec.join(',')}]`;
         }
