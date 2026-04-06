@@ -165,53 +165,43 @@ app.post('/api/auth/google', async (req, res) => {
 // --- APP ENDPOINTS (Protected) ---
 app.use('/api', authMiddleware);
 
-// GET /api/feed (The "V5 SMART k-NN Blend" Endpoint)
+// GET /api/feed (The "V6 EMA k-NN Blend" Endpoint)
 app.get('/api/feed', async (req, res) => {
   const userId = req.user.id;
-  // Evaluate the user's latest 5 distinct liked articles
-  const LIKES_TO_EVALUATE = 5;
   const SMART_FEED_SIZE = 7;
   const DUMB_FEED_SIZE = 3;
 
   try {
-    // Check if user has ANY likes to activate the Recommendation Engine
-    const likeCheck = await pool.query('SELECT 1 FROM user_swipes WHERE user_id = $1 AND liked = true LIMIT 1', [userId]);
+    // Use the new EMA taste_vector to get recommendations
+    const userResult = await pool.query('SELECT taste_vector FROM users WHERE id = $1', [userId]);
+    const tasteVector = userResult.rows[0]?.taste_vector;
 
     let finalFeed = [];
 
-    if (likeCheck.rows.length > 0) {
-      console.log(`Using MULTI-MODAL k-NN feed for user ${userId}`);
+    if (tasteVector) {
+      console.log(`Using EMA taste_vector feed for user ${userId}`);
       
-      // 1. Get 7 SMART articles using a k-Nearest Neighbors projection against ANY of the recent 5 likes
+      // 1. Get 7 SMART articles using a simple k-Nearest Neighbors projection against the user vector
       const smartQuery = `
-        SELECT a.id, a.title, a.description, a.article_url, a.image_url, a.source_name, a.published_at, a.score, a.num_comments, a.hn_id,
-          (
-            SELECT MAX(1 - (a.embedding <=> liked_a.embedding))
-            FROM (
-              SELECT article_id 
-              FROM user_swipes 
-              WHERE user_id = $1 AND liked = true 
-              ORDER BY swipe_time DESC 
-              LIMIT $2
-            ) recent_likes
-            JOIN articles liked_a ON recent_likes.article_id = liked_a.id
-          ) - (COALESCE(EXTRACT(EPOCH FROM (NOW() - a.published_at::timestamp)), 0) / 86400.0 * 0.005) as similarity
-        FROM articles a
-        WHERE a.id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1)
-        ORDER BY similarity DESC NULLS LAST
+        SELECT id, title, description, article_url, image_url, source_name, published_at, score, num_comments, hn_id,
+          1 - (embedding <=> $1) as similarity_raw
+        FROM articles
+        WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $2)
+        ORDER BY embedding <=> $1
         LIMIT $3;
       `;
-      const smartRows = (await pool.query(smartQuery, [userId, LIKES_TO_EVALUATE, SMART_FEED_SIZE])).rows;
+      const smartRows = (await pool.query(smartQuery, [tasteVector, userId, SMART_FEED_SIZE])).rows;
       
-      // Normalize similarity scores to a human-friendly 70-99% range using min-max scaling
-      const rawScores = smartRows.map(r => parseFloat(r.similarity)).filter(s => !isNaN(s));
-      const minS = Math.min(...rawScores);
-      const maxS = Math.max(...rawScores);
-      const range = maxS - minS || 1; // avoid div by 0
+      // Generate honest Match % badges using strict boundaries instead of min-max scaling
       smartRows.forEach(r => {
-        if (r.similarity != null) {
-          const normalized = (parseFloat(r.similarity) - minS) / range; // 0..1
-          r.match_pct = Math.round(70 + normalized * 29); // scale to 70-99
+        if (r.similarity_raw != null) {
+          let score = parseFloat(r.similarity_raw);
+          // all-MiniLM-L6-v2 semantic boundaries: >0.75 is great, <0.40 is poor.
+          if (score > 0.75) score = 0.75;
+          if (score < 0.40) score = 0.40;
+          
+          const boundedNorm = (score - 0.40) / (0.75 - 0.40); // 0.0 to 1.0
+          r.match_pct = Math.round(70 + (boundedNorm * 29)); // Maps strictly to 70% - 99%
         }
       });
       
@@ -222,7 +212,7 @@ app.get('/api/feed', async (req, res) => {
       const idPlaceholders = smartArticleIds.length > 0 ? smartArticleIds.join(',') : '0';
 
       const dumbQuery = `
-        SELECT id, title, description, article_url, image_url, source_name, published_at, score, num_comments, hn_id, NULL as similarity 
+        SELECT id, title, description, article_url, image_url, source_name, published_at, score, num_comments, hn_id, NULL as similarity_raw 
         FROM articles
         WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1)
         AND id NOT IN (${idPlaceholders})
@@ -238,9 +228,9 @@ app.get('/api/feed', async (req, res) => {
 
     } else {
       // --- 100% "DUMB" FEED (New User) ---
-      console.log(`User ${userId} has no likes. Using DUMB feed (random articles)`);
+      console.log(`User ${userId} has no taste_vector yet. Using DUMB feed (random articles)`);
       const dumbQuery = `
-        SELECT id, title, description, article_url, image_url, source_name, published_at, score, num_comments, hn_id, NULL as similarity 
+        SELECT id, title, description, article_url, image_url, source_name, published_at, score, num_comments, hn_id, NULL as similarity_raw 
         FROM articles
         WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1)
         AND published_at::timestamp > NOW() - INTERVAL '14 days'
@@ -274,6 +264,42 @@ app.post('/api/swipe', async (req, res) => {
     `;
     const { rows } = await pool.query(query, [userId, articleId, liked]);
     console.log(`Swipe saved: User ${userId} ${liked ? 'liked' : 'disliked'} Article ${articleId}`);
+
+    // Update the EMA taste_vector if the user liked the article
+    if (liked) {
+      const currentData = await pool.query(`
+        SELECT u.taste_vector, a.embedding
+        FROM users u
+        JOIN articles a ON a.id = $2
+        WHERE u.id = $1
+      `, [userId, articleId]);
+
+      if (currentData.rows.length > 0) {
+        const { taste_vector, embedding } = currentData.rows[0];
+        
+        let newVectorStr;
+        // pgvector returns embeddings as JSON string representation of an array
+        // (Wait, actually pgvector pg driver might return a string "[0.12, 0.45]" 
+        //  in newer node-pg versions or an array. We will parse it to be safe.)
+        const parseVector = (v) => typeof v === 'string' ? JSON.parse(v) : v;
+        const articleVec = parseVector(embedding); 
+
+        if (!taste_vector) {
+          // Initialize taste profile
+          newVectorStr = `[${articleVec.join(',')}]`;
+        } else {
+          // EMA Update
+          const userVec = parseVector(taste_vector);
+          const alpha = 0.1;
+          const newVec = userVec.map((val, i) => (val * (1 - alpha)) + (articleVec[i] * alpha));
+          newVectorStr = `[${newVec.join(',')}]`;
+        }
+        
+        await pool.query(`UPDATE users SET taste_vector = $1 WHERE id = $2`, [newVectorStr, userId]);
+        console.log(`Updated EMA taste vector for User ${userId}`);
+      }
+    }
+
     res.status(201).json(rows[0]);
   } catch (err) {
     console.error('Error saving swipe:', err);
@@ -300,7 +326,9 @@ app.post('/api/reset', async (req, res) => {
   const userId = req.user.id; 
   try {
     await pool.query('DELETE FROM user_swipes WHERE user_id = $1', [userId]);
-    console.log(`Swipes reset for User ${userId}`);
+    // Reset their average embedding vector too
+    await pool.query('UPDATE users SET taste_vector = NULL WHERE id = $1', [userId]);
+    console.log(`Swipes and vector reset for User ${userId}`);
     res.status(200).json({ message: 'Swipes reset successfully' });
   } catch (err) {
     console.error('Error resetting swipes:', err);
@@ -365,12 +393,17 @@ app.get('/api/liked-articles', async (req, res) => {
 });
 
 
-// --- Start Server ---
 const startServer = async () => {
   try {
     const client = await pool.connect();
     const now = await client.query('SELECT NOW()');
     console.log(`✅ Database connected successfully at: ${now.rows[0].now}`);
+    
+    // Add pgvector extension if missing and initialize user taste_vector
+    await client.query('CREATE EXTENSION IF NOT EXISTS vector;');
+    await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS taste_vector vector(384);');
+    console.log(`✅ Schema updated with pgvector support.`);
+    
     client.release();
 
     app.listen(port, () => {
