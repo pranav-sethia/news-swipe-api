@@ -252,6 +252,7 @@ app.get('/api/feed', async (req, res) => {
         FROM articles
         WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1)
           AND id NOT IN (${idBlock})
+          AND embedding IS NOT NULL
           AND published_at::timestamp > NOW() - INTERVAL '14 days'
         ORDER BY RANDOM()
         LIMIT ${DUMB_FETCH}
@@ -268,6 +269,7 @@ app.get('/api/feed', async (req, res) => {
                score, num_comments, hn_id, NULL::float AS similarity_raw
         FROM articles
         WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1)
+          AND embedding IS NOT NULL
           AND published_at::timestamp > NOW() - INTERVAL '14 days'
         ORDER BY RANDOM()
         LIMIT 15
@@ -314,6 +316,12 @@ app.post('/api/swipe', async (req, res) => {
       if (currentData.rows.length > 0) {
         const { taste_vector, embedding } = currentData.rows[0];
         
+        // Safety check: skip taste_vector update if article lacks embedding
+        if (!embedding) {
+          console.log(`Skipping taste vector update: Article ${articleId} lacks embedding.`);
+          return res.status(201).json(rows[0]);
+        }
+
         let newVectorStr;
         // pgvector returns embeddings as JSON string representation of an array
         // (Wait, actually pgvector pg driver might return a string "[0.12, 0.45]" 
