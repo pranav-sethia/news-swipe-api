@@ -10,10 +10,10 @@ const { pipeline } = require('@xenova/transformers');
 // Config
 // ---------------------------------------------------------------------------
 const HN_ALGOLIA_URL =
-  'https://hn.algolia.com/api/v1/search_by_date?tags=story&numericFilters=points>=10&hitsPerPage=80';
+  'https://hn.algolia.com/api/v1/search_by_date?tags=story&numericFilters=points>=100&hitsPerPage=100';
 
 // Minimum points a story must have to be ingested (filters out low-quality posts)
-const MIN_POINTS = 10;
+const MIN_POINTS = 100;
 
 // Timeout (ms) for OpenGraph image scraping — we don't want to block the pipeline
 const OG_FETCH_TIMEOUT_MS = 4000;
