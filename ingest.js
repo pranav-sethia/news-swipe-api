@@ -218,6 +218,12 @@ async function ingestArticles() {
 
       rawText = rawText.replace(/\s+/g, ' ').trim();
 
+      if (rawText.length < 100) {
+        console.log(`   ⚠️  Skipping (insufficient text, < 100 chars): "${title.substring(0, 40)}..."`);
+        skippedCount++;
+        continue;
+      }
+
       console.log(`📰 Processing: "${title.substring(0, 60)}..."`);
 
       let finalDescription = null;

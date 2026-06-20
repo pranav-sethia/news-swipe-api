@@ -19,7 +19,7 @@ const pool = new Pool({
 });
 
 // --- Middleware ---
-const allowedOrigin = process.env.FRONTEND_URL;
+const allowedOrigin = process.env.FRONTEND_URL || '*';
 app.use(cors({ origin: allowedOrigin }));
 app.use(express.json());
 
@@ -34,6 +34,20 @@ function shuffleArray(array) {
     [array[i], array[j]] = [array[j], array[i]];
   }
   return array;
+}
+
+// --- HELPER FUNCTION: Cosine Similarity ---
+function cosineSimilarity(vecA, vecB) {
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < vecA.length; i++) {
+    dotProduct += vecA[i] * vecB[i];
+    normA += vecA[i] * vecA[i];
+    normB += vecB[i] * vecB[i];
+  }
+  if (normA === 0 || normB === 0) return 0;
+  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
 // --- AUTH ENDPOINTS (Public) ---
@@ -214,20 +228,69 @@ app.get('/api/feed', async (req, res) => {
     if (tasteVector) {
       console.log(`[V10] EMA feed for user ${userId}`);
 
-      // 1. Fetch 12 closest articles to the user's EMA taste vector.
+      // 1. Fetch top 40 closest articles to the user's EMA taste vector.
       //    Exclude all previously swiped articles so nothing ever repeats.
-      const smartRows = (await pool.query(`
+      //    Enforce 90-day limit.
+      const CANDIDATE_FETCH = 40;
+      let smartRows = (await pool.query(`
         SELECT id, title, description, article_url, image_url, source_name, published_at,
-               score, num_comments, hn_id,
+               score, num_comments, hn_id, embedding,
                (1 - (embedding <=> $1))::float AS similarity_raw
         FROM articles
         WHERE embedding IS NOT NULL
           AND id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $2 AND article_id IS NOT NULL)
+          AND published_at::timestamp > NOW() - INTERVAL '90 days'
         ORDER BY embedding <=> $1
         LIMIT $3
-      `, [tasteVector, userId, SMART_FETCH])).rows;
+      `, [tasteVector, userId, CANDIDATE_FETCH])).rows;
 
-      // 2. Label ALL smart articles with relative match % (72–99%).
+      // 2. Parse embeddings and apply Time Decay to find top candidates
+      const nowMs = Date.now();
+      const MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+      
+      smartRows.forEach(r => {
+        r.parsed_embedding = typeof r.embedding === 'string' ? JSON.parse(r.embedding) : r.embedding;
+        const simRaw = parseFloat(r.similarity_raw);
+        const ageMs = nowMs - new Date(r.published_at).getTime();
+        const ageRatio = Math.max(0, Math.min(1, ageMs / MAX_AGE_MS));
+        // Recency penalty: older articles lose up to 0.15 of similarity score
+        r.final_score = simRaw - (ageRatio * 0.15); 
+      });
+
+      // Sort by final_score descending
+      smartRows.sort((a, b) => b.final_score - a.final_score);
+
+      // 3. Apply MMR (Maximal Marginal Relevance) to select top diverse articles
+      const selectedSmart = [];
+      for (const candidate of smartRows) {
+        if (selectedSmart.length >= SMART_FETCH) break;
+        
+        let maxSimilarityToSelected = -1;
+        for (const selected of selectedSmart) {
+          const sim = cosineSimilarity(candidate.parsed_embedding, selected.parsed_embedding);
+          if (sim > maxSimilarityToSelected) maxSimilarityToSelected = sim;
+        }
+
+        // Diversity penalty: if it's too similar (> 0.90) to something already selected, skip it
+        if (maxSimilarityToSelected > 0.90) {
+           continue; 
+        }
+        selectedSmart.push(candidate);
+      }
+      
+      // If we filtered out too many, backfill with whatever we had to ensure we hit SMART_FETCH
+      if (selectedSmart.length < SMART_FETCH) {
+        for (const candidate of smartRows) {
+          if (selectedSmart.length >= SMART_FETCH) break;
+          if (!selectedSmart.find(s => s.id === candidate.id)) {
+            selectedSmart.push(candidate);
+          }
+        }
+      }
+
+      smartRows = selectedSmart;
+
+      // 4. Label ALL smart articles with relative match % (72–99%).
       //    Relative scoring means there are ALWAYS badges — no hard threshold that silently drops them.
       if (smartRows.length > 0) {
         const scores = smartRows.map(r => parseFloat(r.similarity_raw));
@@ -237,13 +300,15 @@ app.get('/api/feed', async (req, res) => {
         smartRows.forEach(r => {
           const norm = (parseFloat(r.similarity_raw) - minS) / range;
           r.match_pct = Math.round(72 + norm * 27); // 72% to 99%
+          delete r.embedding; // Cleanup before sending to client
+          delete r.parsed_embedding;
         });
       }
 
-      // 3. Sort ascending: weakest at index 0 (shown last), strongest at end (shown first).
+      // Sort ascending: weakest at index 0 (shown last), strongest at end (shown first).
       smartRows.sort((a, b) => parseFloat(a.similarity_raw) - parseFloat(b.similarity_raw));
 
-      // 4. Serendipity: a few recent random articles the user hasn't seen.
+      // 5. Serendipity: a few recent random articles the user hasn't seen.
       const smartIds = smartRows.map(a => a.id);
       const idBlock  = smartIds.length ? smartIds.join(',') : '0';
       const dumbRows = (await pool.query(`
@@ -253,12 +318,12 @@ app.get('/api/feed', async (req, res) => {
         WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1 AND article_id IS NOT NULL)
           AND id NOT IN (${idBlock})
           AND embedding IS NOT NULL
-          AND published_at::timestamp > NOW() - INTERVAL '14 days'
+          AND published_at::timestamp > NOW() - INTERVAL '90 days'
         ORDER BY RANDOM()
         LIMIT ${DUMB_FETCH}
       `, [userId])).rows;
 
-      // 5. Probabilistic interleave — no fixed pattern, randomized positions with constraints.
+      // 6. Probabilistic interleave — no fixed pattern, randomized positions with constraints.
       finalFeed = randomizedInterleave(smartRows, dumbRows);
 
     } else {
@@ -270,7 +335,7 @@ app.get('/api/feed', async (req, res) => {
         FROM articles
         WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1 AND article_id IS NOT NULL)
           AND embedding IS NOT NULL
-          AND published_at::timestamp > NOW() - INTERVAL '14 days'
+          AND published_at::timestamp > NOW() - INTERVAL '90 days'
         ORDER BY RANDOM()
         LIMIT 15
       `, [userId])).rows;
@@ -302,47 +367,69 @@ app.post('/api/swipe', async (req, res) => {
       RETURNING *
     `;
     const { rows } = await pool.query(query, [userId, articleId, liked]);
-    console.log(`Swipe saved: User ${userId} ${liked ? 'liked' : 'disliked'} Article ${articleId}`);
+    console.log(`Swipe saved: User ${userId} ${liked === null ? 'skipped neutrally' : (liked ? 'liked' : 'disliked')} Article ${articleId}`);
 
-    // Update the EMA taste_vector if the user liked the article
-    if (liked) {
-      const currentData = await pool.query(`
-        SELECT u.taste_vector, a.embedding
-        FROM users u
-        JOIN articles a ON a.id = $2
-        WHERE u.id = $1
-      `, [userId, articleId]);
+    // If neutral skip, do not alter the taste vector.
+    if (liked === null) {
+      return res.status(201).json(rows[0]);
+    }
 
-      if (currentData.rows.length > 0) {
-        const { taste_vector, embedding } = currentData.rows[0];
-        
-        // Safety check: skip taste_vector update if article lacks embedding
-        if (!embedding) {
-          console.log(`Skipping taste vector update: Article ${articleId} lacks embedding.`);
-          return res.status(201).json(rows[0]);
-        }
+    // Update the EMA taste_vector
+    const currentData = await pool.query(`
+      SELECT u.taste_vector, a.embedding,
+             (SELECT COUNT(*) FROM user_swipes WHERE user_id = $1) as total_swipes
+      FROM users u
+      JOIN articles a ON a.id = $2
+      WHERE u.id = $1
+    `, [userId, articleId]);
 
-        let newVectorStr;
-        // pgvector returns embeddings as JSON string representation of an array
-        // (Wait, actually pgvector pg driver might return a string "[0.12, 0.45]" 
-        //  in newer node-pg versions or an array. We will parse it to be safe.)
-        const parseVector = (v) => typeof v === 'string' ? JSON.parse(v) : v;
-        const articleVec = parseVector(embedding); 
+    if (currentData.rows.length > 0) {
+      const { taste_vector, embedding, total_swipes } = currentData.rows[0];
+      
+      // Safety check: skip taste_vector update if article lacks embedding
+      if (!embedding) {
+        console.log(`Skipping taste vector update: Article ${articleId} lacks embedding.`);
+        return res.status(201).json(rows[0]);
+      }
 
-        if (!taste_vector) {
+      const parseVector = (v) => typeof v === 'string' ? JSON.parse(v) : v;
+      const articleVec = parseVector(embedding); 
+
+      let newVectorStr;
+      
+      if (!taste_vector) {
+        if (liked) {
           // Initialize taste profile
           newVectorStr = `[${articleVec.join(',')}]`;
         } else {
-          // EMA Update
-          const userVec = parseVector(taste_vector);
-          const alpha = 0.2; // Fast enough to adapt in 5-10 swipes, stable enough long-term
-          const newVec = userVec.map((val, i) => (val * (1 - alpha)) + (articleVec[i] * alpha));
-          newVectorStr = `[${newVec.join(',')}]`;
+          // First swipe is negative, can't shift an empty vector.
+          return res.status(201).json(rows[0]);
         }
+      } else {
+        const userVec = parseVector(taste_vector);
+        const swipeCount = parseInt(total_swipes, 10);
         
-        await pool.query(`UPDATE users SET taste_vector = $1 WHERE id = $2`, [newVectorStr, userId]);
-        console.log(`Updated EMA taste vector for User ${userId}`);
+        let alpha = 0.2;
+        if (swipeCount <= 10) alpha = 0.5;
+        else if (swipeCount > 50) alpha = 0.05;
+
+        let newVec;
+        if (liked) {
+          newVec = userVec.map((val, i) => (val * (1 - alpha)) + (articleVec[i] * alpha));
+        } else {
+          // Negative swipe: Shift away from article gently to not banish topics forever
+          const negativeAlpha = alpha * 0.15;
+          newVec = userVec.map((val, i) => val - (articleVec[i] * negativeAlpha));
+          // Normalize to keep vector scale stable
+          let magnitude = Math.sqrt(newVec.reduce((sum, val) => sum + val * val, 0));
+          if (magnitude === 0) magnitude = 1;
+          newVec = newVec.map(val => val / magnitude);
+        }
+        newVectorStr = `[${newVec.join(',')}]`;
       }
+      
+      await pool.query(`UPDATE users SET taste_vector = $1 WHERE id = $2`, [newVectorStr, userId]);
+      console.log(`Updated EMA taste vector for User ${userId}`);
     }
 
     res.status(201).json(rows[0]);

@@ -114,6 +114,12 @@ async function main() {
       (metadata.fullText?.length > 80 ? metadata.fullText : metadata.description);
     rawText = rawText?.replace(/\s+/g, ' ').trim() || '';
 
+    if (rawText.length < 100) {
+      console.log(`⏭  Skipped: insufficient text (< 100 chars) for "${title.substring(0, 40)}..."`);
+      skippedCount++;
+      continue;
+    }
+
     process.stdout.write(`📰 "${title.substring(0, 55)}..." `);
 
     let description = null;
