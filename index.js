@@ -6,6 +6,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const authMiddleware = require('./authMiddleware');
 const axios = require('axios');
+const crypto = require('crypto');
 
 const app = express();
 const port = process.env.PORT || 4000;
@@ -104,31 +105,31 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
-// POST /auth/guest — returns a token for the shared guest account
+// POST /auth/guest — creates an ephemeral, isolated guest account
 app.post('/auth/guest', async (req, res) => {
-  const GUEST_EMAIL = 'guest@hackerswipe.io';
-  const GUEST_PASSWORD = process.env.GUEST_PASSWORD || 'guestpass_hackerswipe_2025';
+  const guestUuid = crypto.randomUUID();
+  const guestEmail = `guest_${guestUuid}@hackerswipe.io`;
+  const dummyPassword = crypto.randomBytes(16).toString('hex');
+  
   try {
-    // Ensure guest account exists
-    const existing = await pool.query('SELECT * FROM users WHERE email = $1', [GUEST_EMAIL]);
-    let user = existing.rows[0];
-    if (!user) {
-      const salt = await bcrypt.genSalt(10);
-      const hash = await bcrypt.hash(GUEST_PASSWORD, salt);
-      const { rows } = await pool.query(
-        'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING *',
-        [GUEST_EMAIL, hash]
-      );
-      user = rows[0];
-      console.log('✅ Guest account created.');
-    }
+    const salt = await bcrypt.genSalt(10);
+    const hash = await bcrypt.hash(dummyPassword, salt);
+    
+    const { rows } = await pool.query(
+      'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING *',
+      [guestEmail, hash]
+    );
+    const user = rows[0];
+    console.log(`✅ Ephemeral guest account created: ${guestEmail}`);
+
     const payload = { user: { id: user.id, email: user.email, isGuest: true } };
+    // Guest tokens expire in 24 hours
     jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '24h' }, (err, token) => {
       if (err) throw err;
       res.json({ token });
     });
   } catch (err) {
-    console.error('Error creating guest session:', err);
+    console.error('Error creating ephemeral guest session:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
