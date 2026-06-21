@@ -302,13 +302,12 @@ app.get('/api/feed', async (req, res) => {
       // 4. Label ALL smart articles with relative match % (72–99%).
       //    Relative scoring means there are ALWAYS badges — no hard threshold that silently drops them.
       if (smartRows.length > 0) {
-        const scores = smartRows.map(r => parseFloat(r.similarity_raw));
-        const minS   = Math.min(...scores);
-        const maxS   = Math.max(...scores);
-        const range  = maxS - minS || 0.001;
         smartRows.forEach(r => {
-          const norm = (parseFloat(r.similarity_raw) - minS) / range;
-          r.match_pct = Math.round(72 + norm * 27); // 72% to 99%
+          const sim = parseFloat(r.similarity_raw);
+          // Absolute scaling: Map raw cosine similarity (~0.1 to 0.8) to a percentage (50% to 99%)
+          let norm = (sim - 0.1) / 0.7;
+          norm = Math.max(0, Math.min(1, norm)); // Clamp between 0.0 and 1.0
+          r.match_pct = Math.round(50 + norm * 49); // 50% to 99%
           delete r.embedding; // Cleanup before sending to client
           delete r.parsed_embedding;
         });
