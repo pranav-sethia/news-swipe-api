@@ -233,14 +233,23 @@ app.get('/api/feed', async (req, res) => {
       //    Enforce 90-day limit.
       const CANDIDATE_FETCH = 40;
       let smartRows = (await pool.query(`
-        SELECT id, title, description, article_url, image_url, source_name, published_at,
-               score, num_comments, hn_id, embedding,
-               (1 - (embedding <=> $1))::float AS similarity_raw
-        FROM articles
-        WHERE embedding IS NOT NULL
-          AND id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $2 AND article_id IS NOT NULL)
-          AND published_at::timestamp > NOW() - INTERVAL '90 days'
-        ORDER BY embedding <=> $1
+        SELECT a.id, a.title, a.description, a.article_url, a.image_url, a.source_name, a.published_at,
+               a.score, a.num_comments, a.hn_id, a.embedding,
+               (1 - (a.embedding <=> $1))::float AS similarity_raw,
+               reason.title AS match_reason
+        FROM articles a
+        LEFT JOIN LATERAL (
+          SELECT liked_article.title
+          FROM user_swipes us
+          JOIN articles liked_article ON us.article_id = liked_article.id
+          WHERE us.user_id = $2 AND us.liked = true AND liked_article.embedding IS NOT NULL
+          ORDER BY liked_article.embedding <=> a.embedding
+          LIMIT 1
+        ) reason ON true
+        WHERE a.embedding IS NOT NULL
+          AND a.id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $2 AND article_id IS NOT NULL)
+          AND a.published_at::timestamp > NOW() - INTERVAL '90 days'
+        ORDER BY a.embedding <=> $1
         LIMIT $3
       `, [tasteVector, userId, CANDIDATE_FETCH])).rows;
 
