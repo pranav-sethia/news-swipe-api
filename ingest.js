@@ -16,7 +16,7 @@ const HN_ALGOLIA_URL =
 const MIN_POINTS = 100;
 
 // Timeout (ms) for OpenGraph image scraping — we don't want to block the pipeline
-const OG_FETCH_TIMEOUT_MS = 4000;
+const OG_FETCH_TIMEOUT_MS = 15000;
 
 // ---------------------------------------------------------------------------
 // Database
@@ -141,7 +141,9 @@ async function getArticleMetadata(url) {
       const txt = $(el).text().replace(/\s+/g, ' ').trim();
       // Filter out tiny navigation links, cookie banners, and script warnings
       const isSubstantial = txt.length > 60 && txt.split(' ').length > 8;
-      const isJunk = txt.toLowerCase().match(/(cookie|javascript|subscribe|newsletter|sign in|log in|copyright|all rights reserved)/);
+      // Only filter out "junk" keywords if the paragraph is relatively short (likely a banner/footer).
+      // Legitimate long paragraphs containing the word "subscribe" or "javascript" should NOT be skipped!
+      const isJunk = txt.length < 150 && txt.toLowerCase().match(/(cookie|subscribe to our newsletter|sign in to continue|log in|all rights reserved)/);
       if (isSubstantial && !isJunk) paragraphs.push(txt);
     });
     if (paragraphs.length > 0) fullText = paragraphs.slice(0, 6).join(' ');
