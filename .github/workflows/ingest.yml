@@ -22,8 +22,8 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      # The local Xenova models (t5-small and all-MiniLM-L6-v2) will be downloaded and cached by the runner during this step.
       - name: Run Web Scraper & Local AI Summarization Pipeline
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: node ingest.js

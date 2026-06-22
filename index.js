@@ -327,8 +327,8 @@ app.get('/api/feed', async (req, res) => {
         WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1 AND article_id IS NOT NULL)
           AND id NOT IN (${idBlock})
           AND embedding IS NOT NULL
-          AND published_at::timestamp > NOW() - INTERVAL '90 days'
-        ORDER BY RANDOM()
+          AND published_at::timestamp > NOW() - INTERVAL '7 days'
+        ORDER BY published_at DESC
         LIMIT ${DUMB_FETCH}
       `, [userId])).rows;
 
@@ -344,8 +344,7 @@ app.get('/api/feed', async (req, res) => {
         FROM articles
         WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1 AND article_id IS NOT NULL)
           AND embedding IS NOT NULL
-          AND published_at::timestamp > NOW() - INTERVAL '90 days'
-        ORDER BY RANDOM()
+        ORDER BY published_at DESC
         LIMIT 15
       `, [userId])).rows;
     }
@@ -454,7 +453,36 @@ app.delete('/api/swipe/:articleId', async (req, res) => {
   const { articleId } = req.params;
   try {
     await pool.query('DELETE FROM user_swipes WHERE user_id = $1 AND article_id = $2', [userId, articleId]);
-    console.log(`Swipe deleted: User ${userId} un-liked Article ${articleId}`);
+    
+    // Recalculate taste vector from remaining likes to avoid drift from the deleted swipe
+    const remainingLikes = await pool.query(`
+      SELECT a.embedding 
+      FROM user_swipes us
+      JOIN articles a ON us.article_id = a.id
+      WHERE us.user_id = $1 AND us.liked = true AND a.embedding IS NOT NULL
+      ORDER BY us.swipe_time ASC
+    `, [userId]);
+
+    if (remainingLikes.rows.length === 0) {
+      await pool.query('UPDATE users SET taste_vector = NULL WHERE id = $1', [userId]);
+    } else {
+      const parseVector = (v) => typeof v === 'string' ? JSON.parse(v) : v;
+      let newVec = parseVector(remainingLikes.rows[0].embedding);
+      
+      for (let i = 1; i < remainingLikes.rows.length; i++) {
+        const articleVec = parseVector(remainingLikes.rows[i].embedding);
+        const swipeCount = i + 1;
+        let alpha = 0.2;
+        if (swipeCount <= 10) alpha = 0.5;
+        else if (swipeCount > 50) alpha = 0.05;
+        
+        newVec = newVec.map((val, idx) => (val * (1 - alpha)) + (articleVec[idx] * alpha));
+      }
+      const newVectorStr = `[${newVec.join(',')}]`;
+      await pool.query('UPDATE users SET taste_vector = $1 WHERE id = $2', [newVectorStr, userId]);
+    }
+
+    console.log(`Swipe deleted and vector rebuilt: User ${userId} un-liked Article ${articleId}`);
     res.status(200).json({ message: 'Swipe removed.' });
   } catch (err) {
     console.error('Error deleting swipe:', err);
@@ -473,6 +501,38 @@ app.post('/api/reset', async (req, res) => {
     res.status(200).json({ message: 'Swipes reset successfully' });
   } catch (err) {
     console.error('Error resetting swipes:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /api/taste-profile
+app.get('/api/taste-profile', async (req, res) => {
+  const userId = req.user.id;
+  try {
+    // Tally up the liked categories
+    const query = `
+      SELECT a.category, COUNT(*) as count
+      FROM user_swipes us
+      JOIN articles a ON us.article_id = a.id
+      WHERE us.user_id = $1 AND us.liked = true AND a.category IS NOT NULL
+      GROUP BY a.category
+      ORDER BY count DESC
+    `;
+    const { rows } = await pool.query(query, [userId]);
+    
+    // Calculate total to return percentages
+    let total = 0;
+    rows.forEach(r => total += parseInt(r.count, 10));
+    
+    const profile = rows.map(r => ({
+      category: r.category,
+      count: parseInt(r.count, 10),
+      percentage: total > 0 ? Math.round((parseInt(r.count, 10) / total) * 100) : 0
+    }));
+
+    res.json({ totalLiked: total, profile });
+  } catch (err) {
+    console.error('Error fetching taste profile:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

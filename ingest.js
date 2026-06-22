@@ -1,305 +1,232 @@
 require('dotenv').config();
-
 const axios = require('axios');
 const cheerio = require('cheerio');
 const { Pool } = require('pg');
 
 const { pipeline } = require('@xenova/transformers');
 
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-const HN_ALGOLIA_URL =
-  'https://hn.algolia.com/api/v1/search_by_date?tags=story&numericFilters=points>=100&hitsPerPage=100';
+const OG_FETCH_TIMEOUT_MS = 4000;
 
-// Minimum points a story must have to be ingested (filters out low-quality posts)
-const MIN_POINTS = 100;
-
-// Timeout (ms) for OpenGraph image scraping — we don't want to block the pipeline
-const OG_FETCH_TIMEOUT_MS = 15000;
-
-// ---------------------------------------------------------------------------
-// Database
-// ---------------------------------------------------------------------------
+// Initialize Postgres Pool
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: { rejectUnauthorized: false }
 });
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/** Small delay to avoid hammering external services */
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-let embedder = null;
-let summarizer = null;
-
-async function initModels() {
-  if (!embedder) {
-    console.log('🧠 Loading local ML embedder (Xenova/all-MiniLM-L6-v2) ...');
-    embedder = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', { quantized: true });
-    console.log('✅ Local ML embedder loaded.');
+let extractor;
+async function getExtractor() {
+  if (!extractor) {
+    extractor = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2');
   }
-  if (!summarizer) {
-    console.log('🧠 Loading local AI summarizer (Xenova/t5-small) ...');
-    // Quantized t5-small is only ~60MB and very fast natively
-    summarizer = await pipeline('summarization', 'Xenova/t5-small', { quantized: true });
-    console.log('✅ Local AI summarizer loaded.\n');
-  }
+  return extractor;
 }
 
-/**
- * Uses local AI to distill article text into a crisp 1-2 sentence summary.
- */
-async function getSummary(text) {
-  if (!summarizer) return text.substring(0, 200);
-  
-  if (!text || text.length < 60) return text.trim();
-  
-  try {
-    // T5 models require the 'summarize: ' task prefix
-    const rawText = `summarize: ${text.substring(0, 2500)}`;
-    const result = await summarizer(rawText, {
-      max_new_tokens: 90,
-      min_new_tokens: 15,
-      repetition_penalty: 1.5,
-      no_repeat_ngram_size: 2,
-      num_beams: 3,
-    });
-    
-    let summary = result[0].summary_text.trim();
-    // Enforce proper capitalization and punctuation
-    summary = summary.charAt(0).toUpperCase() + summary.slice(1);
-    if (!summary.match(/[.!?]$/)) summary += '.';
-    
-    return summary;
-  } catch (err) {
-    console.warn(`  ⚠️  Summarization failed: ${err.message}`);
-    return text.substring(0, 150).trim() + '...';
-  }
-}
-
-/**
- * Generates a vector embedding locally via Xenova.
- * @param {string} text
- * @returns {Promise<number[]|null>}
- */
 async function getEmbedding(text) {
-  if (!text || text.trim().length === 0) return null;
   try {
-    const output = await embedder(text.substring(0, 2000), {
-      pooling: 'mean',
-      normalize: true,
-    });
-    return Array.from(output.data);
-  } catch (err) {
-    console.warn(`  ⚠️  Embedding failed: ${err.message}`);
+    const ext = await getExtractor();
+    const output = await ext(text, { pooling: 'mean', normalize: true });
+    return `[${Array.from(output.data).join(',')}]`;
+  } catch (error) {
+    console.error('Error generating embedding:', error);
     return null;
   }
 }
 
+async function getSummary(text) {
+  if (!text || text.length < 200) return null;
 
-/**
- * Attempts to scrape the OpenGraph metadata (image and description) from an article page.
- * Returns null properties if the page is unreachable or missing tags.
- * @param {string} url
- * @returns {Promise<{imageUrl: string|null, description: string|null}>}
- */
-async function getArticleMetadata(url) {
   try {
-    const response = await axios.get(url, {
-      timeout: OG_FETCH_TIMEOUT_MS,
-      // Download up to 500KB to ensure we hit the <body> tags for paragraph extraction
-      maxContentLength: 500_000,
-      responseType: 'text',
-      headers: {
-        // Pretend to be a normal browser so sites don't block us
-        'User-Agent':
-          'Mozilla/5.0 (compatible; NewsSwipeBot/1.0; +https://news-swipe-ui.vercel.app)',
-        Accept: 'text/html',
-      },
-    });
-    const $ = cheerio.load(response.data);
-    const imageUrl =
-      $('meta[property="og:image"]').attr('content') ||
-      $('meta[name="twitter:image"]').attr('content') ||
-      null;
+    const systemPrompt = `You are a strict data extraction tool. You must output exactly in this format:
+CATEGORY: [Exact Category Name]
+- [Bullet 1]
+- [Bullet 2]
+- [Bullet 3]
 
-    let description =
-      $('meta[property="og:description"]').attr('content') ||
-      $('meta[name="twitter:description"]').attr('content') ||
-      $('meta[name="description"]').attr('content') ||
-      null;
+Categories MUST be exactly one of: Artificial Intelligence, Software Engineering, Hardware & Systems, Startups & VC, Cybersecurity, Business & Finance, Science & Space, Design & UI/UX, Web3 & Crypto, Other.`;
+    const prompt = `Extract 1 category and 3 critical facts from the text below.\nRules:\n1. Start each point with a dash (-).\n2. Keep each point strictly UNDER 12 WORDS.\n3. Output NOTHING else.\n\nText:\n${text.substring(0, 4000)}`;
 
-    // Fallback: If no meta tags, grab the first few realistic <p> tags
-    // Always try to grab paragraph text for the AI summarizer
-    let fullText = '';
-    const paragraphs = [];
-    $('p').each((i, el) => {
-      const txt = $(el).text().replace(/\s+/g, ' ').trim();
-      // Filter out tiny navigation links, cookie banners, and script warnings
-      const isSubstantial = txt.length > 60 && txt.split(' ').length > 8;
-      // Only filter out "junk" keywords if the paragraph is relatively short (likely a banner/footer).
-      // Legitimate long paragraphs containing the word "subscribe" or "javascript" should NOT be skipped!
-      const isJunk = txt.length < 150 && txt.toLowerCase().match(/(cookie|subscribe to our newsletter|sign in to continue|log in|all rights reserved)/);
-      if (isSubstantial && !isJunk) paragraphs.push(txt);
+    const res = await fetch('http://127.0.0.1:11434/api/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'llama3.2', system: systemPrompt, prompt: prompt, stream: false })
     });
-    if (paragraphs.length > 0) fullText = paragraphs.slice(0, 6).join(' ');
+    const data = await res.json();
+    const responseText = data.response.trim();
     
-    // Fallback if no meta tags and no body text
-    if (!description && fullText.length > 0) description = fullText.substring(0, 500);
-
-    if (description) description = description.replace(/\s+/g, ' ').trim();
-    if (fullText) fullText = fullText.replace(/\s+/g, ' ').trim();
-
-    return { imageUrl, description, fullText };
-  } catch {
-    // Silently return nulls — many HN links will timeout or block scrapers
-    return { imageUrl: null, description: null };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Main ingestion pipeline
-// ---------------------------------------------------------------------------
-async function ingestArticles() {
-  console.log('🚀 Starting Hacker News ingestion pipeline...\n');
-
-  // Initialize local embedding & summarization models
-  await initModels();
-
-  // 1. Fetch top HN front page stories from Algolia
-  console.log('📡 Fetching Hacker News front page from Algolia...');
-  let hits;
-  try {
-    const { data } = await axios.get(HN_ALGOLIA_URL);
-    hits = data.hits;
-    console.log(`   Found ${hits.length} stories.\n`);
-  } catch (err) {
-    console.error('❌ Failed to fetch from HN Algolia API:', err.message);
-    process.exit(1);
-  }
-
-  // 2. Connect to the database
-  const client = await pool.connect();
-  console.log('✅ Connected to database.\n');
-
-  let savedCount = 0;
-  let skippedCount = 0;
-
-  try {
-    for (const hit of hits) {
-      const { title, url, points, author, created_at, story_text, objectID, num_comments } = hit;
-
-      // --- Filter: must have a title and external URL ---
-      if (!title || !url) {
-        skippedCount++;
-        continue;
-      }
-
-      // --- Filter: must meet minimum quality bar ---
-      if ((points || 0) < MIN_POINTS) {
-        skippedCount++;
-        continue;
-      }
-
-      // Build the HN comments page link as the source
-      const hnCommentsUrl = `https://news.ycombinator.com/item?id=${objectID}`;
-
-      // 3. Scrape OpenGraph image and description (best-effort, non-blocking)
-      const metadata = await getArticleMetadata(url);
-      const imageUrl = metadata.imageUrl;
-
-      // Gather whatever text we can find to feed the AI
-      let rawText = '';
-      if (story_text) rawText = cheerio.load(story_text).text();
-      else if (metadata.fullText && metadata.fullText.length > 80) rawText = metadata.fullText;
-      else if (metadata.description) rawText = metadata.description;
-
-      rawText = rawText.replace(/\s+/g, ' ').trim();
-
-      if (rawText.length < 100) {
-        console.log(`   ⚠️  Skipping (insufficient text, < 100 chars): "${title.substring(0, 40)}..."`);
-        skippedCount++;
-        continue;
-      }
-
-      console.log(`📰 Processing: "${title.substring(0, 60)}..."`);
-
-      let finalDescription = null;
-      if (rawText.length > 60) {
-        process.stdout.write(`   ✨ Generating AI summary... `);
-        finalDescription = await getSummary(rawText);
-        console.log(`Done.`);
-      } else if (rawText.length > 0) {
-        // Short enough to act as a summary natively
-        finalDescription = rawText;
-      } else {
-        finalDescription = `${points} points · ${hit.num_comments ?? 0} comments on Hacker News`;
-      }
-
-      const sourceName = 'Hacker News';
-      const publishedAt = created_at;
-
-      console.log(`   🖼️  Image: ${imageUrl ? '✅ Found' : '❌ None'} | 📝 AI Summary: ${finalDescription !== rawText ? '✅ Generated' : '❌ Fallback'}`);
-
-      // 4. Get vector embedding
-      const textToEmbed = `${title}. ${finalDescription}`;
-      const embedding = await getEmbedding(textToEmbed);
-      if (!embedding) {
-        console.warn(`   ⚠️  Skipping (embedding failed): "${title.substring(0, 40)}"`);
-        skippedCount++;
-        continue;
-      }
-
-      // 5. Upsert into the articles table
-      const embeddingString = `[${embedding.join(',')}]`;
-      const query = `
-        INSERT INTO articles
-          (title, description, article_url, image_url, source_name, published_at, embedding, score, num_comments, hn_id)
-        VALUES
-          ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        ON CONFLICT (article_url) DO UPDATE SET
-          score = EXCLUDED.score,
-          num_comments = EXCLUDED.num_comments,
-          embedding = EXCLUDED.embedding,
-          description = EXCLUDED.description,
-          image_url = EXCLUDED.image_url;
-      `;
-      const values = [
-        title,
-        finalDescription,
-        url,
-        imageUrl,
-        sourceName,
-        publishedAt,
-        embeddingString,
-        points ?? null,
-        num_comments ?? null,
-        objectID,
-      ];
-
-      const result = await client.query(query, values);
-      if (result.rowCount > 0) {
-        savedCount++;
-        console.log(`   ✅ Saved.`);
-      } else {
-        console.log(`   ⏭️  Already exists, skipped.`);
-      }
-
-      // Small delay between articles to be a polite scraper
-      await sleep(500);
+    const lower = responseText.toLowerCase();
+    if (lower.includes("cannot be fulfilled") || lower.includes("insufficient") || lower.includes("unable to extract") || lower.includes("cannot fulfill")) {
+      return null;
     }
-  } finally {
-    client.release();
-    await pool.end();
-  }
 
-  console.log(`\n--- Ingestion Complete ---`);
-  console.log(`✅ Saved: ${savedCount} new articles`);
-  console.log(`⏭️  Skipped: ${skippedCount} articles (low quality, no URL, or embed failure)`);
+    const lines = responseText.split('\n').filter(l => l.trim().length > 0);
+    let category = "Other";
+    let summaryLines = [];
+    
+    for (let line of lines) {
+      if (line.toUpperCase().startsWith("CATEGORY:")) {
+        category = line.substring(9).trim();
+      } else if (line.startsWith("-")) {
+        summaryLines.push(line);
+      }
+    }
+    
+    return { summary: summaryLines.join('\n'), category };
+  } catch (error) {
+    console.error(`Error generating summary via Ollama:`, error.message);
+    return null;
+  }
 }
 
-ingestArticles();
+async function scrapeHackerNews() {
+  try {
+    console.log("Fetching HN front page...");
+    const response = await axios.get('https://news.ycombinator.com/');
+    const $ = cheerio.load(response.data);
+
+    let articles = [];
+
+    $('.athing').each((index, element) => {
+      const id = $(element).attr('id');
+      const titleElement = $(element).find('.titleline > a').first();
+      const title = titleElement.text().trim();
+      const url = titleElement.attr('href');
+      
+      const subtext = $(element).next().find('.subtext');
+      const scoreText = subtext.find('.score').text();
+      const score = scoreText ? parseInt(scoreText.replace(/\D/g, '')) : 0;
+      
+      const commentsText = subtext.find('a').last().text();
+      const commentsMatch = commentsText.match(/(\d+)\s*comment/);
+      const numComments = commentsMatch ? parseInt(commentsMatch[1]) : 0;
+      
+      let articleUrl = url;
+      if (articleUrl && articleUrl.startsWith('item?id=')) {
+        articleUrl = `https://news.ycombinator.com/${articleUrl}`;
+      }
+
+      if (title && articleUrl) {
+        articles.push({
+          hn_id: id,
+          title,
+          url: articleUrl,
+          score,
+          num_comments: numComments
+        });
+      }
+    });
+
+    console.log(`Extracted ${articles.length} articles from front page.`);
+    return articles;
+  } catch (error) {
+    console.error('Error fetching Hacker News:', error.message);
+    return [];
+  }
+}
+
+async function extractArticleData(url) {
+  if (url.includes('news.ycombinator.com')) {
+    return null; 
+  }
+
+  try {
+    const response = await axios.get(url, { 
+      timeout: OG_FETCH_TIMEOUT_MS,
+      headers: { 'User-Agent': 'Mozilla/5.0' } 
+    });
+    const html = response.data;
+    const $ = cheerio.load(html);
+
+    let imageUrl = $('meta[property="og:image"]').attr('content');
+    if (!imageUrl) {
+      imageUrl = $('meta[name="twitter:image"]').attr('content');
+    }
+
+    let sourceName = $('meta[property="og:site_name"]').attr('content');
+    if (!sourceName) {
+      try {
+        const urlObj = new URL(url);
+        sourceName = urlObj.hostname.replace(/^www\./, '');
+      } catch (e) {}
+    }
+
+    $('script, style, nav, footer, header, aside, iframe, noscript').remove();
+    let textContent = $('body').text().replace(/\s+/g, ' ').trim();
+
+    return { imageUrl: imageUrl || null, sourceName: sourceName || null, text: textContent };
+  } catch (error) {
+    return null;
+  }
+}
+
+async function processArticles() {
+  console.log("Starting ingestion process...");
+  
+  const articles = await scrapeHackerNews();
+  
+  for (const article of articles) {
+    try {
+      const existsResult = await pool.query('SELECT id FROM articles WHERE hn_id = $1', [article.hn_id]);
+      if (existsResult.rows.length > 0) {
+        console.log(`Skipping existing article: ${article.title}`);
+        continue;
+      }
+
+      console.log(`Processing new article: ${article.title}`);
+
+      let description = null;
+      let category = null;
+      let imageUrl = null;
+      let sourceName = null;
+      
+      try {
+        const urlObj = new URL(article.url);
+        sourceName = urlObj.hostname.replace(/^www\./, '');
+      } catch (e) {}
+
+      const extractedData = await extractArticleData(article.url);
+      if (extractedData) {
+        const result = await getSummary(extractedData.text);
+        if (result) {
+          description = result.summary;
+          category = result.category;
+        }
+        imageUrl = extractedData.imageUrl || null;
+        if (extractedData.sourceName) sourceName = extractedData.sourceName;
+      }
+
+      if (!description) {
+        console.log(`⚠️ Skipped: Not enough text to summarize properly or LLM refused (${article.title})`);
+        continue;
+      }
+
+      const embeddingText = `${article.title} ${description} ${sourceName || ''}`.trim();
+      const embedding = await getEmbedding(embeddingText);
+
+      await pool.query(
+        `INSERT INTO articles (hn_id, title, article_url, image_url, source_name, published_at, score, num_comments, description, embedding, category)
+         VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8, $9, $10)`,
+        [
+          article.hn_id,
+          article.title,
+          article.url,
+          imageUrl,
+          sourceName,
+          article.score,
+          article.num_comments,
+          description,
+          embedding,
+          category
+        ]
+      );
+      
+      console.log(`✅ Saved: ${article.title}`);
+    } catch (error) {
+      console.error(`❌ Error processing article ${article.hn_id}:`, error.message);
+    }
+  }
+
+  console.log("Ingestion process complete.");
+  pool.end();
+}
+
+processArticles();
