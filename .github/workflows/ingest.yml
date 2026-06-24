@@ -2,8 +2,8 @@ name: Automated News Ingestion Pipeline
 
 on:
   schedule:
-    # Run every 4 hours (e.g., 00:00, 04:00, 08:00, etc.)
-    - cron: '0 */4 * * *'
+    # Run every 2 hours
+    - cron: '0 */2 * * *'
   workflow_dispatch: # Allows manual trigger from the GitHub UI
 
 jobs:
@@ -22,8 +22,8 @@ jobs:
       - name: Install dependencies
         run: npm install
 
-      - name: Run Web Scraper & Local AI Summarization Pipeline
+      - name: Run Web Scraper & Cloud AI Summarization Pipeline
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: node ingest.js

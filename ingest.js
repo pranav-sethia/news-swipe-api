@@ -36,43 +36,57 @@ async function getSummary(text) {
   if (!text || text.length < 200) return null;
 
   try {
-    const systemPrompt = `You are a strict data extraction tool. You must output exactly in this format:
-CATEGORY: [Exact Category Name]
-- [Bullet 1]
-- [Bullet 2]
-- [Bullet 3]
+    const systemPrompt = `You are an expert data extraction algorithm. You ONLY output valid JSON. Do not include any conversational text.`;
+    const promptText = `Analyze the following text and extract exactly 3 bullet points (under 12 words each), 1 category from the list [Software Engineering, Hardware & Systems, Artificial Intelligence, Startups & VC, Cybersecurity, Business & Finance, Science & Space, Design & UI/UX, Web3 & Crypto, Other], 3 highly specific technical tags (e.g., specific framework names, noun phrases, no stop words, e.g. "React 19" instead of "react19"), and an estimated read_time_minutes.
+  
+JSON Schema:
+{
+  "category": "string",
+  "tags": ["string", "string", "string"],
+  "read_time_minutes": number,
+  "bullets": ["string", "string", "string"]
+}`;
 
-Categories MUST be exactly one of: Artificial Intelligence, Software Engineering, Hardware & Systems, Startups & VC, Cybersecurity, Business & Finance, Science & Space, Design & UI/UX, Web3 & Crypto, Other.`;
-    const prompt = `Extract 1 category and 3 critical facts from the text below.\nRules:\n1. Start each point with a dash (-).\n2. Keep each point strictly UNDER 12 WORDS.\n3. Output NOTHING else.\n\nText:\n${text.substring(0, 4000)}`;
+    if (!process.env.GROQ_API_KEY) {
+      throw new Error("Missing GROQ_API_KEY environment variable. Cloud ingestion requires this key.");
+    }
 
-    const res = await fetch('http://127.0.0.1:11434/api/generate', {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'llama3.2', system: systemPrompt, prompt: prompt, stream: false })
+      headers: { 
+        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+        'Content-Type': 'application/json' 
+      },
+      body: JSON.stringify({ 
+        model: 'llama-3.1-8b-instant', 
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: promptText + "\\n\\nText:\\n" + text.substring(0, 4000) }
+        ],
+        temperature: 0.1,
+        response_format: { type: "json_object" }
+      })
     });
     const data = await res.json();
-    const responseText = data.response.trim();
     
-    const lower = responseText.toLowerCase();
-    if (lower.includes("cannot be fulfilled") || lower.includes("insufficient") || lower.includes("unable to extract") || lower.includes("cannot fulfill")) {
-      return null;
-    }
-
-    const lines = responseText.split('\n').filter(l => l.trim().length > 0);
-    let category = "Other";
-    let summaryLines = [];
-    
-    for (let line of lines) {
-      if (line.toUpperCase().startsWith("CATEGORY:")) {
-        category = line.substring(9).trim();
-      } else if (line.startsWith("-")) {
-        summaryLines.push(line);
-      }
+    if (!res.ok) {
+      throw new Error(data.error?.message || 'Failed to fetch from Groq');
     }
     
-    return { summary: summaryLines.join('\n'), category };
+    const responseText = data.choices[0].message.content.trim();
+    const parsed = JSON.parse(responseText);
+    
+    // Convert array of bullets to a single string separated by newlines
+    const summaryLines = parsed.bullets ? parsed.bullets.map(b => b.startsWith('-') ? b : `- ${b}`).join('\\n') : '';
+    
+    return {
+      summary: summaryLines,
+      category: parsed.category || "Other",
+      tags: parsed.tags || [],
+      read_time_minutes: parsed.read_time_minutes || 3
+    };
   } catch (error) {
-    console.error(`Error generating summary via Ollama:`, error.message);
+    console.error(`Error generating summary via Groq:`, error.message);
     return null;
   }
 }
@@ -175,6 +189,8 @@ async function processArticles() {
 
       let description = null;
       let category = null;
+      let tags = null;
+      let readTime = null;
       let imageUrl = null;
       let sourceName = null;
       
@@ -189,6 +205,8 @@ async function processArticles() {
         if (result) {
           description = result.summary;
           category = result.category;
+          tags = JSON.stringify(result.tags);
+          readTime = result.read_time_minutes;
         }
         imageUrl = extractedData.imageUrl || null;
         if (extractedData.sourceName) sourceName = extractedData.sourceName;
@@ -203,8 +221,8 @@ async function processArticles() {
       const embedding = await getEmbedding(embeddingText);
 
       await pool.query(
-        `INSERT INTO articles (hn_id, title, article_url, image_url, source_name, published_at, score, num_comments, description, embedding, category)
-         VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8, $9, $10)`,
+        `INSERT INTO articles (hn_id, title, article_url, image_url, source_name, published_at, score, num_comments, description, embedding, category, tags, read_time_minutes)
+         VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8, $9, $10, $11, $12)`,
         [
           article.hn_id,
           article.title,
@@ -215,7 +233,9 @@ async function processArticles() {
           article.num_comments,
           description,
           embedding,
-          category
+          category,
+          tags,
+          readTime
         ]
       );
       
