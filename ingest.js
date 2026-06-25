@@ -51,26 +51,45 @@ JSON Schema:
       throw new Error("Missing GROQ_API_KEY environment variable. Cloud ingestion requires this key.");
     }
 
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: { 
-        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
-        'Content-Type': 'application/json' 
-      },
-      body: JSON.stringify({ 
-        model: 'llama-3.1-8b-instant', 
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: promptText + "\\n\\nText:\\n" + text.substring(0, 4000) }
-        ],
-        temperature: 0.1,
-        response_format: { type: "json_object" }
-      })
-    });
-    const data = await res.json();
+    let res, data;
+    let retries = 3;
+    while (retries > 0) {
+      res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 
+          'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+          'Content-Type': 'application/json' 
+        },
+        body: JSON.stringify({ 
+          model: 'llama-3.1-8b-instant', 
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: promptText + "\\n\\nText:\\n" + text.substring(0, 4000) }
+          ],
+          temperature: 0.1,
+          response_format: { type: "json_object" }
+        })
+      });
+      data = await res.json();
+      
+      if (res.status === 429) {
+        const waitMsg = data.error?.message || "";
+        const match = waitMsg.match(/try again in (\\d+\\.?\\d*)s/);
+        const waitSeconds = match ? parseFloat(match[1]) : 10;
+        console.log(`⏳ Groq Rate Limit Hit. Waiting ${waitSeconds.toFixed(1)} seconds...`);
+        await new Promise(r => setTimeout(r, (waitSeconds + 0.5) * 1000));
+        retries--;
+        continue;
+      }
+      
+      if (!res.ok) {
+        throw new Error(data.error?.message || 'Failed to fetch from Groq');
+      }
+      break;
+    }
     
-    if (!res.ok) {
-      throw new Error(data.error?.message || 'Failed to fetch from Groq');
+    if (!res || !res.ok) {
+      throw new Error("Exhausted retries for Groq API");
     }
     
     const responseText = data.choices[0].message.content.trim();
@@ -95,7 +114,7 @@ JSON Schema:
       summary: summaryLines,
       category: finalCategory,
       tags: validTags,
-      read_time_minutes: typeof parsed.read_time_minutes === 'number' ? parsed.read_time_minutes : 3
+      read_time_minutes: typeof parsed.read_time_minutes === 'number' ? Math.round(parsed.read_time_minutes) : 3
     };
   } catch (error) {
     console.error(`Error generating summary via Groq:`, error.message);
