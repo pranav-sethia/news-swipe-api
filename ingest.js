@@ -76,14 +76,26 @@ JSON Schema:
     const responseText = data.choices[0].message.content.trim();
     const parsed = JSON.parse(responseText);
     
-    // Convert array of bullets to a single string separated by newlines
-    const summaryLines = parsed.bullets ? parsed.bullets.map(b => b.startsWith('-') ? b : `- ${b}`).join('\\n') : '';
+    let validBullets = Array.isArray(parsed.bullets) ? parsed.bullets.slice(0, 3) : [];
+    const summaryLines = validBullets.map(b => {
+      let text = b.replace(/^- /, '').trim();
+      let words = text.split(/\s+/);
+      if (words.length > 12) {
+        text = words.slice(0, 12).join(' ') + '...';
+      }
+      return `- ${text}`;
+    }).join('\n');
+
+    const allowedCategories = ["Software Engineering", "Hardware & Systems", "Artificial Intelligence", "Startups & VC", "Cybersecurity", "Business & Finance", "Science & Space", "Design & UI/UX", "Web3 & Crypto", "Other"];
+    const finalCategory = allowedCategories.includes(parsed.category) ? parsed.category : "Other";
+    
+    let validTags = Array.isArray(parsed.tags) ? parsed.tags.slice(0, 3).map(t => String(t).substring(0, 20)) : [];
     
     return {
       summary: summaryLines,
-      category: parsed.category || "Other",
-      tags: parsed.tags || [],
-      read_time_minutes: parsed.read_time_minutes || 3
+      category: finalCategory,
+      tags: validTags,
+      read_time_minutes: typeof parsed.read_time_minutes === 'number' ? parsed.read_time_minutes : 3
     };
   } catch (error) {
     console.error(`Error generating summary via Groq:`, error.message);
@@ -219,6 +231,11 @@ async function processArticles() {
 
       const embeddingText = `${article.title} ${description} ${sourceName || ''}`.trim();
       const embedding = await getEmbedding(embeddingText);
+
+      if (!embedding) {
+        console.log(`⚠️ Skipped: Failed to generate vector embedding (${article.title})`);
+        continue;
+      }
 
       await pool.query(
         `INSERT INTO articles (hn_id, title, article_url, image_url, source_name, published_at, score, num_comments, description, embedding, category, tags, read_time_minutes)
