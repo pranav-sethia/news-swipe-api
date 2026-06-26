@@ -37,13 +37,14 @@ async function getSummary(text) {
 
   try {
     const systemPrompt = `You are an expert data extraction algorithm. You ONLY output valid JSON. Do not include any conversational text.`;
-    const promptText = `Analyze the following text and extract exactly 3 bullet points (under 12 words each), 1 category from the list [Software Engineering, Hardware & Systems, Artificial Intelligence, Startups & VC, Cybersecurity, Business & Finance, Science & Space, Design & UI/UX, Web3 & Crypto, Other], 3 highly specific technical tags (e.g., specific framework names, noun phrases, no stop words, e.g. "React 19" instead of "react19"), and an estimated read_time_minutes.
+    const promptText = `Analyze the following text and extract exactly 3 bullet points (under 12 words each), 1 category from the list [Software Engineering, Hardware & Systems, Artificial Intelligence, Startups & VC, Cybersecurity, Business & Finance, Science & Space, Design & UI/UX, Web3 & Crypto, Other], and 3 highly specific technical tags (e.g., specific framework names, noun phrases, no stop words, e.g. "React 19" instead of "react19").
+    
+CRITICAL: If the article is about random internet culture, food, lifestyle, DIY, history, or does not strongly fit into one of the specific tech categories, you MUST categorize it as "Other". Do not guess a tech category for non-tech articles.
   
 JSON Schema:
 {
   "category": "string",
   "tags": ["string", "string", "string"],
-  "read_time_minutes": number,
   "bullets": ["string", "string", "string"]
 }`;
 
@@ -114,7 +115,7 @@ JSON Schema:
       summary: summaryLines,
       category: finalCategory,
       tags: validTags,
-      read_time_minutes: typeof parsed.read_time_minutes === 'number' ? Math.round(parsed.read_time_minutes) : 3
+      bullets: parsed.bullets
     };
   } catch (error) {
     console.error(`Error generating summary via Groq:`, error.message);
@@ -168,6 +169,9 @@ async function scrapeHackerNews() {
   }
 }
 
+const { Readability } = require('@mozilla/readability');
+const { JSDOM } = require('jsdom');
+
 async function extractArticleData(url) {
   if (url.includes('news.ycombinator.com')) {
     return null; 
@@ -194,10 +198,24 @@ async function extractArticleData(url) {
       } catch (e) {}
     }
 
-    $('script, style, nav, footer, header, aside, iframe, noscript').remove();
-    let textContent = $('body').text().replace(/\s+/g, ' ').trim();
+    const doc = new JSDOM(html, { url });
+    const reader = new Readability(doc.window.document);
+    const articleData = reader.parse();
+    
+    let textContent = "";
+    if (articleData && articleData.textContent) {
+      textContent = articleData.textContent;
+    } else {
+      let pTexts = [];
+      $('p').each((i, el) => pTexts.push($(el).text()));
+      textContent = pTexts.join(' ');
+    }
+    
+    textContent = textContent.replace(/\s+/g, ' ').trim();
+    const wordCount = textContent.split(/\s+/).length;
+    const readTimeMinutes = Math.max(1, Math.ceil(wordCount / 225));
 
-    return { imageUrl: imageUrl || null, sourceName: sourceName || null, text: textContent };
+    return { imageUrl: imageUrl || null, sourceName: sourceName || null, text: textContent, readTimeMinutes };
   } catch (error) {
     return null;
   }
@@ -237,7 +255,7 @@ async function processArticles() {
           description = result.summary;
           category = result.category;
           tags = JSON.stringify(result.tags);
-          readTime = result.read_time_minutes;
+          readTime = extractedData.readTimeMinutes;
         }
         imageUrl = extractedData.imageUrl || null;
         if (extractedData.sourceName) sourceName = extractedData.sourceName;

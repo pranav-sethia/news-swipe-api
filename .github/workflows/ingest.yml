@@ -27,3 +27,9 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: node ingest.js
+
+      - name: Update Article Statistics (Points & Comments)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: node scripts/update_scores.js
+

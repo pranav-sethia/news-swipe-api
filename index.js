@@ -235,7 +235,7 @@ app.get('/api/feed', async (req, res) => {
       const CANDIDATE_FETCH = 40;
       let smartRows = (await pool.query(`
         SELECT a.id, a.title, a.description, a.article_url, a.image_url, a.source_name, a.published_at,
-               a.score, a.num_comments, a.hn_id, a.embedding,
+               a.score, a.num_comments, a.hn_id, a.embedding, a.read_time_minutes,
                (1 - (a.embedding <=> $1))::float AS similarity_raw,
                reason.title AS match_reason
         FROM articles a
@@ -322,13 +322,13 @@ app.get('/api/feed', async (req, res) => {
       const idBlock  = smartIds.length ? smartIds.join(',') : '0';
       const dumbRows = (await pool.query(`
         SELECT id, title, description, article_url, image_url, source_name, published_at,
-               score, num_comments, hn_id, NULL::float AS similarity_raw
+               score, num_comments, hn_id, read_time_minutes, NULL::float AS similarity_raw
         FROM articles
         WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1 AND article_id IS NOT NULL)
           AND id NOT IN (${idBlock})
           AND embedding IS NOT NULL
           AND published_at::timestamp > NOW() - INTERVAL '7 days'
-        ORDER BY published_at DESC
+        ORDER BY RANDOM()
         LIMIT ${DUMB_FETCH}
       `, [userId])).rows;
 
@@ -340,7 +340,7 @@ app.get('/api/feed', async (req, res) => {
       console.log(`[V10] No taste_vector for user ${userId} — discovery feed`);
       finalFeed = (await pool.query(`
         SELECT id, title, description, article_url, image_url, source_name, published_at,
-               score, num_comments, hn_id, NULL::float AS similarity_raw
+               score, num_comments, hn_id, read_time_minutes, NULL::float AS similarity_raw
         FROM articles
         WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1 AND article_id IS NOT NULL)
           AND embedding IS NOT NULL
@@ -454,35 +454,63 @@ app.delete('/api/swipe/:articleId', async (req, res) => {
   try {
     await pool.query('DELETE FROM user_swipes WHERE user_id = $1 AND article_id = $2', [userId, articleId]);
     
-    // Recalculate taste vector from remaining likes to avoid drift from the deleted swipe
-    const remainingLikes = await pool.query(`
-      SELECT a.embedding 
+    // Recalculate taste vector from remaining likes AND dislikes to perfectly reconstruct the ML vector
+    const allSwipes = await pool.query(`
+      SELECT a.embedding, us.liked
       FROM user_swipes us
       JOIN articles a ON us.article_id = a.id
-      WHERE us.user_id = $1 AND us.liked = true AND a.embedding IS NOT NULL
+      WHERE us.user_id = $1 AND us.liked IS NOT NULL AND a.embedding IS NOT NULL
       ORDER BY us.swipe_time ASC
     `, [userId]);
 
-    if (remainingLikes.rows.length === 0) {
+    if (allSwipes.rows.length === 0) {
       await pool.query('UPDATE users SET taste_vector = NULL WHERE id = $1', [userId]);
     } else {
       const parseVector = (v) => typeof v === 'string' ? JSON.parse(v) : v;
-      let newVec = parseVector(remainingLikes.rows[0].embedding);
+      let newVec = null;
+      let swipeCount = 0;
       
-      for (let i = 1; i < remainingLikes.rows.length; i++) {
-        const articleVec = parseVector(remainingLikes.rows[i].embedding);
-        const swipeCount = i + 1;
+      for (let i = 0; i < allSwipes.rows.length; i++) {
+        const row = allSwipes.rows[i];
+        const articleVec = parseVector(row.embedding);
+        const liked = row.liked;
+
+        if (newVec === null) {
+          if (liked) {
+            newVec = articleVec;
+            swipeCount++;
+          }
+          // If first swipe is negative, we can't initialize the vector, so we skip
+          continue;
+        }
+
+        swipeCount++;
         let alpha = 0.2;
         if (swipeCount <= 10) alpha = 0.5;
         else if (swipeCount > 50) alpha = 0.05;
-        
-        newVec = newVec.map((val, idx) => (val * (1 - alpha)) + (articleVec[idx] * alpha));
+
+        if (liked) {
+          newVec = newVec.map((val, idx) => (val * (1 - alpha)) + (articleVec[idx] * alpha));
+        } else {
+          const negativeAlpha = alpha * 0.15;
+          newVec = newVec.map((val, idx) => val - (articleVec[idx] * negativeAlpha));
+          // Normalize to keep vector scale stable
+          let magnitude = Math.sqrt(newVec.reduce((sum, val) => sum + val * val, 0));
+          if (magnitude === 0) magnitude = 1;
+          newVec = newVec.map(val => val / magnitude);
+        }
       }
-      const newVectorStr = `[${newVec.join(',')}]`;
-      await pool.query('UPDATE users SET taste_vector = $1 WHERE id = $2', [newVectorStr, userId]);
+      
+      if (newVec === null) {
+         // This happens if all remaining swipes are dislikes and we never got a first like.
+         await pool.query('UPDATE users SET taste_vector = NULL WHERE id = $1', [userId]);
+      } else {
+         const newVectorStr = `[${newVec.join(',')}]`;
+         await pool.query('UPDATE users SET taste_vector = $1 WHERE id = $2', [newVectorStr, userId]);
+      }
     }
 
-    console.log(`Swipe deleted and vector rebuilt: User ${userId} un-liked Article ${articleId}`);
+    console.log(`Swipe deleted and vector perfectly rebuilt: User ${userId} un-liked Article ${articleId}`);
     res.status(200).json({ message: 'Swipe removed.' });
   } catch (err) {
     console.error('Error deleting swipe:', err);
