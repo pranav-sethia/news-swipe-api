@@ -43,6 +43,7 @@ CRITICAL: If the article is about random internet culture, food, lifestyle, DIY,
   
 JSON Schema:
 {
+  "reasoning": "string (briefly explain why the category fits the text based on the rules)",
   "category": "string",
   "tags": ["string", "string", "string"],
   "bullets": ["string", "string", "string"]
@@ -62,7 +63,7 @@ JSON Schema:
           'Content-Type': 'application/json' 
         },
         body: JSON.stringify({ 
-          model: 'llama-3.1-8b-instant', 
+          model: 'llama-3.3-70b-versatile', 
           messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: promptText + "\\n\\nText:\\n" + text.substring(0, 4000) }
@@ -297,6 +298,50 @@ async function processArticles() {
     } catch (error) {
       console.error(`❌ Error processing article ${article.hn_id}:`, error.message);
     }
+  }
+
+  // --- AUTO-REPAIR BLOCK ---
+  console.log("Starting auto-repair of flagged articles...");
+  try {
+    const suspectResult = await pool.query(`
+      SELECT id, title, article_url, source_name 
+      FROM articles 
+      WHERE category = 'REPROCESS'
+      LIMIT 5
+    `);
+
+    for (const article of suspectResult.rows) {
+      console.log(`Auto-repairing article: ${article.title}`);
+      
+      const extractedData = await extractArticleData(article.article_url);
+      if (extractedData) {
+        const result = await getSummary(extractedData.text);
+        if (result) {
+          const newDesc = result.summary;
+          const newCat = result.category;
+          const newTags = JSON.stringify(result.tags);
+          
+          const embeddingText = `${article.title} ${newDesc} ${extractedData.sourceName || article.source_name || ''}`.trim();
+          const newEmbedding = await getEmbedding(embeddingText);
+          
+          if (newEmbedding) {
+            await pool.query(
+              `UPDATE articles 
+               SET description = $1, category = $2, tags = $3, embedding = $4, read_time_minutes = $5 
+               WHERE id = $6`,
+              [newDesc, newCat, newTags, newEmbedding, extractedData.readTimeMinutes, article.id]
+            );
+            console.log(`✅ Repaired: ${article.title} -> ${newCat}`);
+            continue;
+          }
+        }
+      }
+      // If any step fails (e.g. 404 URL, LLM fail), clear the flag by dumping it into 'Other' so it doesn't loop forever
+      console.log(`⚠️ Failed to repair: ${article.title} - Setting category to 'Other' to clear flag.`);
+      await pool.query(`UPDATE articles SET category = 'Other' WHERE id = $1`, [article.id]);
+    }
+  } catch (err) {
+    console.error("Error during auto-repair:", err.message);
   }
 
   console.log("Ingestion process complete.");

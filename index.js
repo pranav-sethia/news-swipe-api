@@ -57,13 +57,46 @@ app.post('/auth/register', async (req, res) => {
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required.' });
   }
+  if (password.length < 8) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters long.' });
+  }
   try {
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
-    const query = 'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email';
-    const { rows } = await pool.query(query, [email, passwordHash]);
-    console.log(`New user registered: ${email}`);
-    res.status(201).json(rows[0]);
+    let user;
+
+    // Check if upgrading from guest
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.split(' ')[1];
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        if (decoded && decoded.user && decoded.user.isGuest) {
+          const updateQuery = 'UPDATE users SET email = $1, password_hash = $2 WHERE id = $3 RETURNING id, email';
+          const { rows } = await pool.query(updateQuery, [email, passwordHash, decoded.user.id]);
+          user = rows[0];
+          console.log(`Guest user ${decoded.user.id} upgraded to registered: ${email}`);
+        }
+      } catch (err) { /* ignore invalid token */ }
+    }
+
+    if (!user) {
+      const query = 'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email';
+      const { rows } = await pool.query(query, [email, passwordHash]);
+      user = rows[0];
+      console.log(`New user registered: ${email}`);
+    }
+    
+    const payload = { user: { id: user.id, email: user.email } };
+    jwt.sign(
+      payload,
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' },
+      (err, token) => {
+        if (err) throw err;
+        res.status(201).json({ token, user });
+      }
+    );
   } catch (err) {
     if (err.code === '23505') {
       return res.status(400).json({ error: 'Email already in use.' });
@@ -154,7 +187,7 @@ app.post('/api/auth/google', async (req, res) => {
 
     // If no user, create one securely with a random unguessable password hash
     if (!user) {
-      const dummyPassword = 'GOOGLE_SSO_' + Array.from({length: 32}, () => Math.random().toString(36).charAt(2)).join('');
+      const dummyPassword = 'GOOGLE_SSO_' + crypto.randomBytes(32).toString('hex');
       const salt = await bcrypt.genSalt(10);
       const hash = await bcrypt.hash(dummyPassword, salt);
       const inserted = await pool.query(
@@ -221,6 +254,9 @@ app.get('/api/feed', async (req, res) => {
   const DUMB_FETCH  = 3;  // ~20% serendipity
 
   try {
+    // Update user activity to track inactive accounts
+    await pool.query('UPDATE users SET last_active = NOW() WHERE id = $1', [userId]).catch(err => console.error('Failed to update last_active:', err));
+
     const userResult = await pool.query('SELECT taste_vector FROM users WHERE id = $1', [userId]);
     const tasteVector = userResult.rows[0]?.taste_vector;
 
@@ -248,7 +284,7 @@ app.get('/api/feed', async (req, res) => {
           LIMIT 1
         ) reason ON true
         WHERE a.embedding IS NOT NULL
-          AND a.id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $2 AND article_id IS NOT NULL)
+          AND NOT EXISTS (SELECT 1 FROM user_swipes us2 WHERE us2.user_id = $2 AND us2.article_id = a.id)
           AND a.published_at::timestamp > NOW() - INTERVAL '90 days'
         ORDER BY a.embedding <=> $1
         LIMIT $3
@@ -324,7 +360,7 @@ app.get('/api/feed', async (req, res) => {
         SELECT id, title, description, article_url, image_url, source_name, published_at,
                score, num_comments, hn_id, read_time_minutes, NULL::float AS similarity_raw
         FROM articles
-        WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1 AND article_id IS NOT NULL)
+        WHERE NOT EXISTS (SELECT 1 FROM user_swipes us2 WHERE us2.user_id = $1 AND us2.article_id = articles.id)
           AND id NOT IN (${idBlock})
           AND embedding IS NOT NULL
           AND published_at::timestamp > NOW() - INTERVAL '7 days'
@@ -342,7 +378,7 @@ app.get('/api/feed', async (req, res) => {
         SELECT id, title, description, article_url, image_url, source_name, published_at,
                score, num_comments, hn_id, read_time_minutes, NULL::float AS similarity_raw
         FROM articles
-        WHERE id NOT IN (SELECT article_id FROM user_swipes WHERE user_id = $1 AND article_id IS NOT NULL)
+        WHERE NOT EXISTS (SELECT 1 FROM user_swipes us2 WHERE us2.user_id = $1 AND us2.article_id = articles.id)
           AND embedding IS NOT NULL
         ORDER BY published_at DESC
         LIMIT 15
@@ -372,13 +408,14 @@ app.post('/api/swipe', async (req, res) => {
       INSERT INTO user_swipes (user_id, article_id, liked)
       VALUES ($1, $2, $3)
       ON CONFLICT (user_id, article_id) DO UPDATE SET liked = $3, swipe_time = NOW()
-      RETURNING *
+      RETURNING *, (xmax = 0) AS is_inserted
     `;
     const { rows } = await pool.query(query, [userId, articleId, liked]);
+    const isInserted = rows[0].is_inserted;
     console.log(`Swipe saved: User ${userId} ${liked === null ? 'skipped neutrally' : (liked ? 'liked' : 'disliked')} Article ${articleId}`);
 
-    // If neutral skip, do not alter the taste vector.
-    if (liked === null) {
+    // If neutral skip or it was a duplicate swipe, do not alter the taste vector.
+    if (liked === null || !isInserted) {
       return res.status(201).json(rows[0]);
     }
 
@@ -456,11 +493,15 @@ app.delete('/api/swipe/:articleId', async (req, res) => {
     
     // Recalculate taste vector from remaining likes AND dislikes to perfectly reconstruct the ML vector
     const allSwipes = await pool.query(`
-      SELECT a.embedding, us.liked
-      FROM user_swipes us
-      JOIN articles a ON us.article_id = a.id
-      WHERE us.user_id = $1 AND us.liked IS NOT NULL AND a.embedding IS NOT NULL
-      ORDER BY us.swipe_time ASC
+      SELECT * FROM (
+        SELECT a.embedding, us.liked, us.swipe_time
+        FROM user_swipes us
+        JOIN articles a ON us.article_id = a.id
+        WHERE us.user_id = $1 AND us.liked IS NOT NULL AND a.embedding IS NOT NULL
+        ORDER BY us.swipe_time DESC
+        LIMIT 100
+      ) sub
+      ORDER BY sub.swipe_time ASC
     `, [userId]);
 
     if (allSwipes.rows.length === 0) {
@@ -622,6 +663,73 @@ app.get('/api/liked-articles', async (req, res) => {
 });
 
 
+// GET /api/me/stats
+app.get('/api/me/stats', async (req, res) => {
+  const userId = req.user.id;
+  try {
+    const query = `
+      SELECT 
+        COUNT(*) as total,
+        COUNT(*) FILTER (WHERE liked = true) as likes,
+        COUNT(*) FILTER (WHERE liked = false) as dislikes,
+        COUNT(*) FILTER (WHERE liked IS NULL) as skips
+      FROM user_swipes
+      WHERE user_id = $1
+    `;
+    const { rows } = await pool.query(query, [userId]);
+    const r = rows[0];
+    
+    // Calculate a simple day streak in JS
+    const streakQuery = `
+      SELECT DISTINCT DATE(swipe_time) as swipe_date
+      FROM user_swipes
+      WHERE user_id = $1
+      ORDER BY swipe_date DESC
+      LIMIT 30
+    `;
+    const streakRows = await pool.query(streakQuery, [userId]);
+    let streak = 0;
+    if (streakRows.rows.length > 0) {
+      let current = new Date();
+      current.setHours(0,0,0,0);
+      let foundTodayOrYesterday = false;
+      
+      for (let i = 0; i < streakRows.rows.length; i++) {
+        const d = new Date(streakRows.rows[i].swipe_date);
+        d.setHours(0,0,0,0);
+        const diffDays = Math.floor((current - d) / (1000 * 60 * 60 * 24));
+        
+        if (i === 0) {
+          if (diffDays <= 1) {
+            streak = 1;
+            current = d;
+          } else {
+            break;
+          }
+        } else {
+          if (diffDays === 1) {
+            streak++;
+            current = d;
+          } else {
+            break;
+          }
+        }
+      }
+    }
+
+    res.json({
+      total: parseInt(r.total || 0, 10),
+      likes: parseInt(r.likes || 0, 10),
+      dislikes: parseInt(r.dislikes || 0, 10),
+      skips: parseInt(r.skips || 0, 10),
+      streak
+    });
+  } catch (err) {
+    console.error('Error fetching detailed stats:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 const startServer = async () => {
   try {
     const client = await pool.connect();
@@ -634,6 +742,25 @@ const startServer = async () => {
     console.log(`✅ Schema updated with pgvector support.`);
     
     client.release();
+
+    // Start background job to cleanup stale guest accounts (inactive for > 7 days)
+    const cleanupStaleGuests = async () => {
+      try {
+        const result = await pool.query(`
+          DELETE FROM users 
+          WHERE email LIKE 'guest_%@hackerswipe.io' 
+            AND last_active < NOW() - INTERVAL '7 days'
+        `);
+        if (result.rowCount > 0) {
+          console.log(`🧹 Cleaned up ${result.rowCount} inactive guest accounts.`);
+        }
+      } catch (err) {
+        console.error('Failed to cleanup guest accounts:', err);
+      }
+    };
+    // Run once on startup, then every 24 hours
+    cleanupStaleGuests();
+    setInterval(cleanupStaleGuests, 24 * 60 * 60 * 1000);
 
     app.listen(port, () => {
       console.log(`Server running on port ${port}`);

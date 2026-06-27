@@ -33,3 +33,7 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: node scripts/update_scores.js
 
+      - name: Cleanup Inactive Guest Accounts
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: node scripts/cleanup_guests.js
