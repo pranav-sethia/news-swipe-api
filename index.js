@@ -167,23 +167,18 @@ app.post('/auth/guest', async (req, res) => {
   }
 });
 
-const { OAuth2Client } = require('google-auth-library');
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID || '1074955057997-1t711kuk94bjvn1rec5oq88c3uckg1at.apps.googleusercontent.com');
-
-// POST /api/auth/google — verifies Google JWT id_token and issues app JWT
+// POST /api/auth/google — verifies Google access_token and issues app JWT
 app.post('/api/auth/google', async (req, res) => {
-  const { credential } = req.body; // In this case, it's a JWT id_token from <GoogleLogin>
+  const { credential } = req.body; // access_token from redirect flow
   if (!credential) return res.status(400).json({ error: 'Missing credential' });
 
   try {
-    // Verify the JWT securely using Google's official library
-    const ticket = await googleClient.verifyIdToken({
-      idToken: credential,
-      audience: process.env.GOOGLE_CLIENT_ID || '1074955057997-1t711kuk94bjvn1rec5oq88c3uckg1at.apps.googleusercontent.com',
+    // Ping Google to verify token and get user profile
+    const { data: googleUser } = await axios.get('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${credential}` }
     });
     
-    const payload = ticket.getPayload();
-    const email = payload.email;
+    const email = googleUser.email;
     if (!email) throw new Error('No email found in Google token');
 
     // Check if user exists
