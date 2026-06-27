@@ -743,25 +743,6 @@ const startServer = async () => {
     
     client.release();
 
-    // Start background job to cleanup stale guest accounts (inactive for > 7 days)
-    const cleanupStaleGuests = async () => {
-      try {
-        const result = await pool.query(`
-          DELETE FROM users 
-          WHERE email LIKE 'guest_%@hackerswipe.io' 
-            AND last_active < NOW() - INTERVAL '7 days'
-        `);
-        if (result.rowCount > 0) {
-          console.log(`🧹 Cleaned up ${result.rowCount} inactive guest accounts.`);
-        }
-      } catch (err) {
-        console.error('Failed to cleanup guest accounts:', err);
-      }
-    };
-    // Run once on startup, then every 24 hours
-    cleanupStaleGuests();
-    setInterval(cleanupStaleGuests, 24 * 60 * 60 * 1000);
-
     app.listen(port, () => {
       console.log(`Server running on port ${port}`);
     });

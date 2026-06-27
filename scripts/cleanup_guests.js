@@ -9,11 +9,11 @@ const pool = new Pool({
 async function cleanupOldGuests() {
   console.log('Running guest account cleanup job...');
   try {
-    // Delete any users whose email starts with guest_ AND whose last_active is older than 30 days
+    // Delete any users whose email starts with guest_ AND whose last_active is older than 7 days
     const query = `
       DELETE FROM users 
       WHERE email LIKE 'guest_%@hackerswipe.io' 
-      AND last_active < NOW() - INTERVAL '30 days'
+      AND last_active < NOW() - INTERVAL '7 days'
       RETURNING id;
     `;
     const res = await pool.query(query);
