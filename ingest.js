@@ -39,7 +39,9 @@ async function getSummary(text) {
     const systemPrompt = `You are an expert data extraction algorithm. You ONLY output valid JSON. Do not include any conversational text.`;
     const promptText = `Analyze the following text and extract exactly 3 bullet points (under 12 words each), 1 category from the list [Software Engineering, Hardware & Systems, Artificial Intelligence, Startups & VC, Cybersecurity, Business & Finance, Science & Space, Design & UI/UX, Web3 & Crypto, Other], and 3 highly specific technical tags (e.g., specific framework names, noun phrases, no stop words, e.g. "React 19" instead of "react19").
     
-CRITICAL: If the article is about random internet culture, food, lifestyle, DIY, history, or does not strongly fit into one of the specific tech categories, you MUST categorize it as "Other". Do not guess a tech category for non-tech articles.
+CRITICAL CATEGORIZATION RULES:
+1. "Business & Finance" or "Startups & VC" takes precedence over specific tech categories if the primary focus of the article is acquisitions, funding rounds, stock market moves, corporate pricing strategies, or business restructuring (e.g., "Meta buys AI startup" -> Business & Finance or Startups & VC, NOT Artificial Intelligence. "Micron locks in high memory prices" -> Business & Finance).
+2. Only use "Other" for articles about random internet culture, food, lifestyle, DIY, history, or completely non-tech/non-business topics. Do not use "Other" for tech-adjacent corporate news.
   
 JSON Schema:
 {
