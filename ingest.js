@@ -32,21 +32,34 @@ async function getEmbedding(text) {
   }
 }
 
-async function getSummary(text) {
+async function getSummary(text, title) {
   if (!text || text.length < 200) return null;
 
   try {
-    const systemPrompt = `You are an expert data extraction algorithm. You ONLY output valid JSON. Do not include any conversational text.`;
-    const promptText = `Analyze the following text and extract exactly 3 bullet points (under 12 words each), 1 category from the list [Software Engineering, Hardware & Systems, Artificial Intelligence, Startups & VC, Cybersecurity, Business & Finance, Science & Space, Design & UI/UX, Web3 & Crypto, Other], and 3 highly specific technical tags (e.g., specific framework names, noun phrases, no stop words, e.g. "React 19" instead of "react19").
-    
-CRITICAL CATEGORIZATION RULES:
-1. "Business & Finance" or "Startups & VC" takes precedence over specific tech categories if the primary focus of the article is acquisitions, funding rounds, stock market moves, corporate pricing strategies, or business restructuring (e.g., "Meta buys AI startup" -> Business & Finance or Startups & VC, NOT Artificial Intelligence. "Micron locks in high memory prices" -> Business & Finance).
-2. Only use "Other" for articles about random internet culture, food, lifestyle, DIY, history, or completely non-tech/non-business topics. Do not use "Other" for tech-adjacent corporate news.
-  
-JSON Schema:
+    const systemPrompt = `You are a precision taxonomy and classification engine for a technology news aggregator. Your task is to analyze the provided text and output a JSON object.`;
+    const promptText = `Classify the following text into exactly ONE of the following categories based on its primary theme:
+
+TAXONOMY:
+- Software Engineering: Programming languages, web/mobile development, databases, algorithms, DevOps, infrastructure, open-source projects, game development, and software architecture.
+- Hardware & Systems: Semiconductors, GPUs, networking, servers, operating systems, embedded systems, robotics, IoT, self-driving technology, and consumer electronics (e.g., Apple hardware).
+- Artificial Intelligence: LLMs, machine learning, neural networks, computer vision, data science, NLP, and AI agents.
+- Startups & VC: Early-stage companies, venture capital, fundraising, incubators (like YC), entrepreneurship, founders, and product management.
+- Cybersecurity: Vulnerabilities, hacking, zero-days, infosec, privacy laws, encryption (non-crypto), malware, and network security.
+- Business & Finance: Corporate acquisitions (M&A), earnings reports, stock market, tech industry economics, Big Tech antitrust/lawsuits, layoffs, FCC/FTC tech regulations, and enterprise pricing.
+- Science & Space: Physics, biology, biotech, medicine, astronomy, aerospace (e.g., SpaceX), mathematics, climate tech, and energy.
+- Design & UI/UX: Typography, frontend aesthetics, user experience research, human-computer interaction (HCI), and web accessibility.
+- Web3 & Crypto: Blockchains, cryptography protocols, cryptocurrencies, decentralization, and smart contracts.
+- Other: Use ONLY for purely non-tech/non-science/non-business topics, such as classical history, food recipes, random internet culture, DIY crafts, or personal storytelling.
+
+RULES:
+1. Determine the PRIMARY theme. If an article covers an AI startup raising money, the primary theme is Startups & VC.
+2. You must provide your step-by-step reasoning BEFORE outputting the final category.
+3. Extract exactly 3 bullet points (under 11 words each) and 3 highly specific technical tags.
+
+JSON SCHEMA:
 {
-  "reasoning": "string (briefly explain why the category fits the text based on the rules)",
-  "category": "string",
+  "reasoning": "string (Explain step-by-step why the primary theme fits the chosen category)",
+  "category": "string (Must be exactly one category from the TAXONOMY list)",
   "tags": ["string", "string", "string"],
   "bullets": ["string", "string", "string"]
 }`;
@@ -68,7 +81,7 @@ JSON Schema:
           model: 'llama-3.3-70b-versatile', 
           messages: [
             { role: 'system', content: systemPrompt },
-            { role: 'user', content: promptText + "\\n\\nText:\\n" + text.substring(0, 4000) }
+            { role: 'user', content: promptText + "\\n\\nTitle: " + title + "\\n\\nArticle Text:\\n" + text.substring(0, 4000) }
           ],
           temperature: 0.1,
           response_format: { type: "json_object" }
@@ -103,8 +116,8 @@ JSON Schema:
     const summaryLines = validBullets.map(b => {
       let text = b.replace(/^- /, '').trim();
       let words = text.split(/\s+/);
-      if (words.length > 12) {
-        text = words.slice(0, 12).join(' ') + '...';
+      if (words.length > 11) {
+        text = words.slice(0, 11).join(' ') + '...';
       }
       return `- ${text}`;
     }).join('\n');
@@ -253,7 +266,7 @@ async function processArticles() {
 
       const extractedData = await extractArticleData(article.url);
       if (extractedData) {
-        const result = await getSummary(extractedData.text);
+        const result = await getSummary(extractedData.text, article.title);
         if (result) {
           description = result.summary;
           category = result.category;
@@ -317,7 +330,7 @@ async function processArticles() {
       
       const extractedData = await extractArticleData(article.article_url);
       if (extractedData) {
-        const result = await getSummary(extractedData.text);
+        const result = await getSummary(extractedData.text, article.title);
         if (result) {
           const newDesc = result.summary;
           const newCat = result.category;
