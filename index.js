@@ -481,6 +481,10 @@ app.post('/api/swipe', async (req, res) => {
 
     res.status(201).json(rows[0]);
   } catch (err) {
+    if (err.code === '23503') {
+      console.log(`Article ${articleId} no longer exists. Dropping swipe silently.`);
+      return res.status(200).json({ message: 'Article deleted, swipe ignored.' });
+    }
     console.error('Error saving swipe:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
