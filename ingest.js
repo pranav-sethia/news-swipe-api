@@ -252,11 +252,6 @@ async function processArticles() {
       let readTime = null;
       let imageUrl = null;
       let sourceName = null;
-      
-      try {
-        const urlObj = new URL(article.url);
-        sourceName = urlObj.hostname.replace(/^www\./, '');
-      } catch (e) {}
 
       const extractedData = await extractArticleData(article.url);
       if (extractedData) {
