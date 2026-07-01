@@ -374,7 +374,7 @@ app.get('/api/feed', async (req, res) => {
     } else {
       // New user: pure discovery feed until first like.
       console.log(`[V10] No taste_vector for user ${userId} — discovery feed`);
-      finalFeed = (await pool.query(`
+      const rawFeed = (await pool.query(`
         SELECT id, title, description, article_url, image_url, source_name, published_at,
                score, num_comments, hn_id, read_time_minutes, NULL::float AS similarity_raw
         FROM articles
@@ -383,6 +383,8 @@ app.get('/api/feed', async (req, res) => {
         ORDER BY published_at DESC
         LIMIT 15
       `, [userId])).rows;
+      // Reverse so the newest article is at the end of the array (top of the deck in the UI)
+      finalFeed = rawFeed.reverse();
     }
 
     res.json(finalFeed);

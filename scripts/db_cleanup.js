@@ -17,6 +17,12 @@ async function runCleanup() {
     const { rows: articles } = await client.query('SELECT id, title, description FROM articles');
     console.log(`Found ${articles.length} total articles.`);
 
+    console.log("\nDeleting articles older than 90 days...");
+    const deleteSwipesRes = await client.query("DELETE FROM user_swipes WHERE article_id IN (SELECT id FROM articles WHERE created_at < NOW() - INTERVAL '90 days')");
+    console.log(`Deleted ${deleteSwipesRes.rowCount} associated user swipes.`);
+    const deleteRes = await client.query("DELETE FROM articles WHERE created_at < NOW() - INTERVAL '90 days'");
+    console.log(`Deleted ${deleteRes.rowCount} old articles.`);
+
     const toDeleteIds = [];
     let countNoDescription = 0;
     let countNonEnglish = 0;
@@ -69,6 +75,7 @@ async function runCleanup() {
       const chunkSize = 100;
       for (let i = 0; i < toDeleteIds.length; i += chunkSize) {
         const chunk = toDeleteIds.slice(i, i + chunkSize);
+        await client.query('DELETE FROM user_swipes WHERE article_id = ANY($1)', [chunk]);
         await client.query('DELETE FROM articles WHERE id = ANY($1)', [chunk]);
       }
       console.log("✅ Cleanup complete!");

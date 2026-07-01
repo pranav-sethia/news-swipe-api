@@ -54,7 +54,8 @@ TAXONOMY:
 RULES:
 1. Determine the PRIMARY theme. If an article covers an AI startup raising money, the primary theme is Startups & VC.
 2. You must provide your step-by-step reasoning BEFORE outputting the final category.
-3. Extract exactly 3 bullet points (under 11 words each) and 3 highly specific technical tags.
+3. Extract exactly 3 bullet points summarizing the article's core news value objectively. Each bullet must be extremely concise, no more than 60 characters in length. Focus on short, punchy phrases.
+4. Extract 3 highly specific technical tags.
 
 JSON SCHEMA:
 {
@@ -62,7 +63,9 @@ JSON SCHEMA:
   "category": "string (Must be exactly one category from the TAXONOMY list)",
   "tags": ["string", "string", "string"],
   "bullets": ["string", "string", "string"]
-}`;
+}
+
+Rules for bullets: They MUST NOT exceed 60 characters.`;
 
     if (!process.env.GROQ_API_KEY) {
       throw new Error("Missing GROQ_API_KEY environment variable. Cloud ingestion requires this key.");
@@ -78,7 +81,7 @@ JSON SCHEMA:
           'Content-Type': 'application/json' 
         },
         body: JSON.stringify({ 
-          model: 'llama-3.3-70b-versatile', 
+          model: 'llama-3.1-8b-instant', 
           messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: promptText + "\\n\\nTitle: " + title + "\\n\\nArticle Text:\\n" + text.substring(0, 4000) }
@@ -115,10 +118,6 @@ JSON SCHEMA:
     let validBullets = Array.isArray(parsed.bullets) ? parsed.bullets.slice(0, 3) : [];
     const summaryLines = validBullets.map(b => {
       let text = b.replace(/^- /, '').trim();
-      let words = text.split(/\s+/);
-      if (words.length > 11) {
-        text = words.slice(0, 11).join(' ') + '...';
-      }
       return `- ${text}`;
     }).join('\n');
 
@@ -141,46 +140,39 @@ JSON SCHEMA:
 
 async function scrapeHackerNews() {
   try {
-    console.log("Fetching HN front page...");
-    const response = await axios.get('https://news.ycombinator.com/');
-    const $ = cheerio.load(response.data);
-
-    let articles = [];
-
-    $('.athing').each((index, element) => {
-      const id = $(element).attr('id');
-      const titleElement = $(element).find('.titleline > a').first();
-      const title = titleElement.text().trim();
-      const url = titleElement.attr('href');
+    console.log("Fetching HN top 500 stories from API...");
+    const response = await axios.get('https://hacker-news.firebaseio.com/v0/topstories.json');
+    const top500Ids = response.data;
+    
+    // Check which ones we already have
+    const existingResult = await pool.query('SELECT hn_id FROM articles');
+    const existingIds = new Set(existingResult.rows.map(row => String(row.hn_id)));
+    
+    let newArticles = [];
+    
+    for (const id of top500Ids) {
+      if (newArticles.length >= 20) break; // Cap at 20 new articles to protect Groq 70B token limit
       
-      const subtext = $(element).next().find('.subtext');
-      const scoreText = subtext.find('.score').text();
-      const score = scoreText ? parseInt(scoreText.replace(/\D/g, '')) : 0;
+      if (existingIds.has(String(id))) continue;
       
-      const commentsText = subtext.find('a').last().text();
-      const commentsMatch = commentsText.match(/(\d+)\s*comment/);
-      const numComments = commentsMatch ? parseInt(commentsMatch[1]) : 0;
+      // Fetch details
+      const itemRes = await axios.get(`https://hacker-news.firebaseio.com/v0/item/${id}.json`);
+      const item = itemRes.data;
+      if (!item || item.type !== 'story' || !item.url) continue;
       
-      let articleUrl = url;
-      if (articleUrl && articleUrl.startsWith('item?id=')) {
-        articleUrl = `https://news.ycombinator.com/${articleUrl}`;
-      }
-
-      if (title && articleUrl) {
-        articles.push({
-          hn_id: id,
-          title,
-          url: articleUrl,
-          score,
-          num_comments: numComments
-        });
-      }
-    });
-
-    console.log(`Extracted ${articles.length} articles from front page.`);
-    return articles;
+      newArticles.push({
+        hn_id: String(item.id),
+        title: item.title,
+        url: item.url,
+        score: item.score || 0,
+        num_comments: item.descendants || 0
+      });
+    }
+    
+    console.log(`Extracted ${newArticles.length} completely new articles from the top 500.`);
+    return newArticles;
   } catch (error) {
-    console.error('Error fetching Hacker News:', error.message);
+    console.error('Error fetching Hacker News API:', error.message);
     return [];
   }
 }
@@ -310,54 +302,15 @@ async function processArticles() {
       );
       
       console.log(`✅ Saved: ${article.title}`);
+      
+      // Safety delay to prevent Groq rate limit (especially when ingesting 15 articles rapidly)
+      await new Promise(r => setTimeout(r, 5000));
+      
     } catch (error) {
       console.error(`❌ Error processing article ${article.hn_id}:`, error.message);
     }
   }
 
-  // --- AUTO-REPAIR BLOCK ---
-  console.log("Starting auto-repair of flagged articles...");
-  try {
-    const suspectResult = await pool.query(`
-      SELECT id, title, article_url, source_name 
-      FROM articles 
-      WHERE category = 'REPROCESS'
-      LIMIT 5
-    `);
-
-    for (const article of suspectResult.rows) {
-      console.log(`Auto-repairing article: ${article.title}`);
-      
-      const extractedData = await extractArticleData(article.article_url);
-      if (extractedData) {
-        const result = await getSummary(extractedData.text, article.title);
-        if (result) {
-          const newDesc = result.summary;
-          const newCat = result.category;
-          const newTags = JSON.stringify(result.tags);
-          
-          const embeddingText = `${article.title} ${newDesc} ${extractedData.sourceName || article.source_name || ''}`.trim();
-          const newEmbedding = await getEmbedding(embeddingText);
-          
-          if (newEmbedding) {
-            await pool.query(
-              `UPDATE articles 
-               SET description = $1, category = $2, tags = $3, embedding = $4, read_time_minutes = $5 
-               WHERE id = $6`,
-              [newDesc, newCat, newTags, newEmbedding, extractedData.readTimeMinutes, article.id]
-            );
-            console.log(`✅ Repaired: ${article.title} -> ${newCat}`);
-            continue;
-          }
-        }
-      }
-      // If any step fails (e.g. 404 URL, LLM fail), clear the flag by dumping it into 'Other' so it doesn't loop forever
-      console.log(`⚠️ Failed to repair: ${article.title} - Setting category to 'Other' to clear flag.`);
-      await pool.query(`UPDATE articles SET category = 'Other' WHERE id = $1`, [article.id]);
-    }
-  } catch (err) {
-    console.error("Error during auto-repair:", err.message);
-  }
 
   console.log("Ingestion process complete.");
   pool.end();
