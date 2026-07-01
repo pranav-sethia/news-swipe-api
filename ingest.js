@@ -54,7 +54,7 @@ TAXONOMY:
 RULES:
 1. Determine the PRIMARY theme. If an article covers an AI startup raising money, the primary theme is Startups & VC.
 2. You must provide your step-by-step reasoning BEFORE outputting the final category.
-3. Extract exactly 3 bullet points summarizing the article's core news value objectively. Each bullet must be extremely concise, no more than 60 characters in length. Focus on short, punchy phrases.
+3. Extract exactly 3 bullet points summarizing the article's core news value objectively. Each bullet must be extremely concise, using no more than 10 words per bullet point. Do not exceed 10 words.
 4. Extract 3 highly specific technical tags.
 
 JSON SCHEMA:
@@ -65,7 +65,7 @@ JSON SCHEMA:
   "bullets": ["string", "string", "string"]
 }
 
-Rules for bullets: They MUST NOT exceed 60 characters.`;
+Rules for bullets: They MUST NOT exceed 10 words each.`;
 
     if (!process.env.GROQ_API_KEY) {
       throw new Error("Missing GROQ_API_KEY environment variable. Cloud ingestion requires this key.");
