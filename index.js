@@ -395,8 +395,100 @@ app.get('/api/feed', async (req, res) => {
   }
 });
 
+// GET /api/comments/:hnId/summary - Summarize Hacker News comments using Groq
+app.get('/api/comments/:hnId/summary', authMiddleware, async (req, res) => {
+  const { hnId } = req.params;
+  
+  if (req.user && req.user.email && req.user.email.startsWith('guest_')) {
+    return res.status(402).json({ error: 'guest_restricted', message: 'Please create an account to use this feature.' });
+  }
+  
+  try {
+    const cacheRes = await pool.query(
+      `SELECT comments_summary, summary_generated_at FROM articles WHERE hn_id = $1`,
+      [hnId]
+    );
+    if (cacheRes.rows.length > 0) {
+      const row = cacheRes.rows[0];
+      if (row.comments_summary && row.summary_generated_at) {
+        const hoursSince = (new Date() - new Date(row.summary_generated_at)) / (1000 * 60 * 60);
+        if (hoursSince < 24) {
+          return res.json({ status: 'success', summary: row.comments_summary });
+        }
+      }
+    }
 
+    const { data } = await axios.get(`https://hn.algolia.com/api/v1/items/${hnId}`);
+    
+    let extractedText = "";
+    let commentCount = 0;
+    
+    const extractComments = (children) => {
+      if (!children || children.length === 0) return;
+      for (const child of children) {
+        if (commentCount >= 20) return;
+        if (child.text) {
+          const plainText = child.text.replace(/<[^>]*>?/gm, ' ').replace(/\s+/g, ' ').trim();
+          extractedText += `User ${child.author}: ${plainText}\n`;
+          commentCount++;
+        }
+        extractComments(child.children);
+      }
+    };
+    
+    extractComments(data.children);
+    
+    if (commentCount < 3 || extractedText.length < 200) {
+      return res.json({ status: 'insufficient', message: 'Not enough comments to generate a meaningful consensus.' });
+    }
+    
+    const systemPrompt = `You are an expert summarizer. Analyze the provided Hacker News comment thread. Identify and completely ignore tangential, pedantic, or off-topic arguments. Focus your summary strictly on the core discussion regarding the main article.
+    
+JSON SCHEMA:
+{
+  "consensus": "A 1-2 sentence overarching sentiment of the thread.",
+  "takeaways": ["Point 1", "Point 2", "Point 3"],
+  "criticisms": ["Criticism 1"]
+}
 
+RULES:
+1. If the community is overwhelmingly positive and there are no notable criticisms, return an empty array [] for criticisms.
+2. Be extremely concise. Keep takeaways to a single sentence each.`;
+    
+    if (!process.env.GROQ_API_KEY) throw new Error("Missing GROQ_API_KEY");
+    
+    const groqRes = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
+      model: 'llama-3.1-8b-instant',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: "Comment Thread:\n" + extractedText.substring(0, 6000) }
+      ],
+      temperature: 0.2,
+      response_format: { type: "json_object" }
+    }, {
+      headers: { 
+        'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+        'Content-Type': 'application/json' 
+      }
+    });
+    
+    const responseText = groqRes.data.choices[0].message.content.trim();
+    const parsed = JSON.parse(responseText);
+    
+    await pool.query(
+      `UPDATE articles SET comments_summary = $1, summary_generated_at = NOW() WHERE hn_id = $2`,
+      [parsed, hnId]
+    );
+    
+    res.json({ status: 'success', summary: parsed });
+  } catch (err) {
+    if (err.response && err.response.status === 429) {
+      return res.status(429).json({ error: 'rate_limited', message: 'The AI is currently resting due to high demand. Please try again later.' });
+    }
+    console.error('Error generating comment summary:', err.message);
+    res.status(500).json({ error: 'Failed to generate summary' });
+  }
+});
 
 // POST /api/swipe
 app.post('/api/swipe', async (req, res) => {
@@ -467,11 +559,11 @@ app.post('/api/swipe', async (req, res) => {
           // Negative swipe: Shift away from article gently to not banish topics forever
           const negativeAlpha = alpha * 0.15;
           newVec = userVec.map((val, i) => val - (articleVec[i] * negativeAlpha));
-          // Normalize to keep vector scale stable
-          let magnitude = Math.sqrt(newVec.reduce((sum, val) => sum + val * val, 0));
-          if (magnitude === 0) magnitude = 1;
-          newVec = newVec.map(val => val / magnitude);
         }
+        // Normalize to keep vector scale stable
+        let magnitude = Math.sqrt(newVec.reduce((sum, val) => sum + val * val, 0));
+        if (magnitude === 0) magnitude = 1;
+        newVec = newVec.map(val => val / magnitude);
         newVectorStr = `[${newVec.join(',')}]`;
       }
       
@@ -541,11 +633,11 @@ app.delete('/api/swipe/:articleId', async (req, res) => {
         } else {
           const negativeAlpha = alpha * 0.15;
           newVec = newVec.map((val, idx) => val - (articleVec[idx] * negativeAlpha));
-          // Normalize to keep vector scale stable
-          let magnitude = Math.sqrt(newVec.reduce((sum, val) => sum + val * val, 0));
-          if (magnitude === 0) magnitude = 1;
-          newVec = newVec.map(val => val / magnitude);
         }
+        // Normalize to keep vector scale stable
+        let magnitude = Math.sqrt(newVec.reduce((sum, val) => sum + val * val, 0));
+        if (magnitude === 0) magnitude = 1;
+        newVec = newVec.map(val => val / magnitude);
       }
       
       if (newVec === null) {
@@ -745,7 +837,10 @@ const startServer = async () => {
     // Add pgvector extension if missing and initialize user taste_vector
     await client.query('CREATE EXTENSION IF NOT EXISTS vector;');
     await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS taste_vector vector(384);');
-    console.log(`✅ Schema updated with pgvector support.`);
+    await client.query('ALTER TABLE articles ADD COLUMN IF NOT EXISTS comments_summary JSONB;');
+    await client.query('ALTER TABLE articles ADD COLUMN IF NOT EXISTS summary_generated_at TIMESTAMP;');
+    await client.query('CREATE INDEX IF NOT EXISTS articles_embedding_idx ON articles USING hnsw (embedding vector_cosine_ops);');
+    console.log(`✅ Schema updated with pgvector support and HNSW index.`);
     
     client.release();
 
