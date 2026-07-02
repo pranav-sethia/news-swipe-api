@@ -418,7 +418,16 @@ app.get('/api/comments/:hnId/summary', authMiddleware, async (req, res) => {
       }
     }
 
-    const { data } = await axios.get(`https://hn.algolia.com/api/v1/items/${hnId}`);
+    let data;
+    try {
+      const algoliaRes = await axios.get(`https://hn.algolia.com/api/v1/items/${hnId}`);
+      data = algoliaRes.data;
+    } catch (algoliaErr) {
+      if (algoliaErr.response && algoliaErr.response.status === 404) {
+        return res.json({ status: 'insufficient', message: 'This article is too new. Comments are still being indexed by our search provider. Please try again shortly.' });
+      }
+      throw algoliaErr;
+    }
     
     let extractedText = "";
     let commentCount = 0;
@@ -487,11 +496,18 @@ RULES:
     
     res.json({ status: 'success', summary: parsed });
   } catch (err) {
-    if (err.response && err.response.status === 429) {
-      return res.status(429).json({ error: 'rate_limited', message: 'The AI is currently resting due to high demand. Please try again later.' });
+    if (err.response) {
+      if (err.response.status === 429) {
+        return res.status(429).json({ error: 'rate_limited', message: 'The AI is currently resting due to high demand. Please try again later.' });
+      }
+      // Pass the specific AI/API error back to the frontend for debugging
+      const apiErrorMsg = err.response.data?.error?.message || err.response.statusText || 'API Error';
+      console.error(`API Error ${err.response.status}:`, apiErrorMsg);
+      return res.status(500).json({ error: 'api_error', message: `AI Service Error: ${apiErrorMsg}` });
     }
+    
     console.error('Error generating comment summary:', err.message);
-    res.status(500).json({ error: 'Failed to generate summary' });
+    res.status(500).json({ error: 'Failed to generate summary', message: err.message });
   }
 });
 
