@@ -453,12 +453,13 @@ JSON SCHEMA:
 
 RULES:
 1. If the community is overwhelmingly positive and there are no notable criticisms, return an empty array [] for criticisms.
-2. Be extremely concise. Keep takeaways to a single sentence each.`;
+2. Be extremely concise. Keep takeaways to a single sentence each.
+3. CRITICAL: Output ONLY a valid JSON object matching the schema. DO NOT include any conversational text, prefixes, or markdown formatting. Your entire response must be parseable by JSON.parse().`;
     
     if (!process.env.GROQ_API_KEY) throw new Error("Missing GROQ_API_KEY");
     
     const groqRes = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
-      model: 'llama-3.3-70b-versatile',
+      model: 'llama-3.1-8b-instant',
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: "Comment Thread:\n" + extractedText.substring(0, 6000) }
