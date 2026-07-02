@@ -458,7 +458,7 @@ RULES:
     if (!process.env.GROQ_API_KEY) throw new Error("Missing GROQ_API_KEY");
     
     const groqRes = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
-      model: 'llama-3.1-8b-instant',
+      model: 'llama-3.3-70b-versatile',
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: "Comment Thread:\n" + extractedText.substring(0, 6000) }
@@ -473,7 +473,11 @@ RULES:
     });
     
     const responseText = groqRes.data.choices[0].message.content.trim();
-    const parsed = JSON.parse(responseText);
+    
+    // Robustly extract JSON in case the model included conversational filler
+    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error("No JSON object found in response");
+    const parsed = JSON.parse(jsonMatch[0]);
     
     await pool.query(
       `UPDATE articles SET comments_summary = $1, summary_generated_at = NOW() WHERE hn_id = $2`,
