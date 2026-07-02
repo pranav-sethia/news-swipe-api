@@ -462,8 +462,7 @@ JSON SCHEMA:
 
 RULES:
 1. If the community is overwhelmingly positive and there are no notable criticisms, return an empty array [] for criticisms.
-2. Be extremely concise. Keep takeaways to a single sentence each.
-3. CRITICAL: Output ONLY a valid JSON object matching the schema. DO NOT include any conversational text, prefixes, or markdown formatting. Your entire response must be parseable by JSON.parse().`;
+2. Be extremely concise. Keep takeaways to a single sentence each.`;
     
     if (!process.env.GROQ_API_KEY) throw new Error("Missing GROQ_API_KEY");
     
@@ -483,11 +482,7 @@ RULES:
     });
     
     const responseText = groqRes.data.choices[0].message.content.trim();
-    
-    // Robustly extract JSON in case the model included conversational filler
-    const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error("No JSON object found in response");
-    const parsed = JSON.parse(jsonMatch[0]);
+    const parsed = JSON.parse(responseText);
     
     await pool.query(
       `UPDATE articles SET comments_summary = $1, summary_generated_at = NOW() WHERE hn_id = $2`,
