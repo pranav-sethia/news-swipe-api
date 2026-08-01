@@ -20,7 +20,7 @@ const authMiddleware = (req, res, next) => {
 
   try {
     // 4. Verify the token using our secret key
-    const decodedToken = jwt.verify(token, JWT_SECRET);
+    const decodedToken = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
 
     // 5. Token is valid! Attach the user's info to the request object.
     // We will use this in our endpoints (e.g., req.user.id)

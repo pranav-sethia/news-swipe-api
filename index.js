@@ -1,6 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -20,9 +22,34 @@ const pool = new Pool({
 });
 
 // --- Middleware ---
-const allowedOrigin = process.env.FRONTEND_URL || '*';
+// Supports a single origin or a comma-separated list, e.g. "https://hackerswipe.io,https://www.hackerswipe.io"
+const allowedOrigins = (process.env.FRONTEND_URL || '*').split(',').map(o => o.trim()).filter(Boolean);
+const allowedOrigin = allowedOrigins.length === 1 ? allowedOrigins[0] : allowedOrigins;
+// This is a pure JSON API consumed from a different origin (the Vercel-hosted frontend),
+// so relax CORP/CSP defaults that assume same-origin HTML serving.
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  contentSecurityPolicy: false,
+}));
 app.use(cors({ origin: allowedOrigin }));
 app.use(express.json());
+
+// --- Rate Limiting ---
+// Generous limits — sized to stop bots/brute-force, not real users.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts. Please try again in a few minutes.' },
+});
+const summaryLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'rate_limited', message: 'Too many summary requests. Please try again shortly.' },
+});
 
 // --- Health Check (Keep-Alive) ---
 app.get('/api/health', (req, res) => res.status(200).send('OK'));
@@ -52,7 +79,7 @@ function cosineSimilarity(vecA, vecB) {
 }
 
 // --- AUTH ENDPOINTS (Public) ---
-app.post('/auth/register', async (req, res) => {
+app.post('/auth/register', authLimiter, async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required.' });
@@ -70,7 +97,7 @@ app.post('/auth/register', async (req, res) => {
     if (authHeader && authHeader.startsWith('Bearer ')) {
       const token = authHeader.split(' ')[1];
       try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
         if (decoded && decoded.user && decoded.user.isGuest) {
           const updateQuery = 'UPDATE users SET email = $1, password_hash = $2 WHERE id = $3 RETURNING id, email';
           const { rows } = await pool.query(updateQuery, [email, passwordHash, decoded.user.id]);
@@ -106,7 +133,7 @@ app.post('/auth/register', async (req, res) => {
   }
 });
 
-app.post('/auth/login', async (req, res) => {
+app.post('/auth/login', authLimiter, async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required.' });
@@ -139,7 +166,7 @@ app.post('/auth/login', async (req, res) => {
 });
 
 // POST /auth/guest — creates an ephemeral, isolated guest account
-app.post('/auth/guest', async (req, res) => {
+app.post('/auth/guest', authLimiter, async (req, res) => {
   const guestUuid = crypto.randomUUID();
   const guestEmail = `guest_${guestUuid}@hackerswipe.io`;
   const dummyPassword = crypto.randomBytes(16).toString('hex');
@@ -168,7 +195,7 @@ app.post('/auth/guest', async (req, res) => {
 });
 
 // POST /api/auth/google — verifies Google access_token and issues app JWT
-app.post('/api/auth/google', async (req, res) => {
+app.post('/api/auth/google', authLimiter, async (req, res) => {
   const { credential } = req.body; // access_token from redirect flow
   if (!credential) return res.status(400).json({ error: 'Missing credential' });
 
@@ -396,13 +423,17 @@ app.get('/api/feed', async (req, res) => {
 });
 
 // GET /api/comments/:hnId/summary - Summarize Hacker News comments using Groq
-app.get('/api/comments/:hnId/summary', authMiddleware, async (req, res) => {
+app.get('/api/comments/:hnId/summary', authMiddleware, summaryLimiter, async (req, res) => {
   const { hnId } = req.params;
-  
+
+  if (!/^\d+$/.test(hnId)) {
+    return res.status(400).json({ error: 'Invalid hnId' });
+  }
+
   if (req.user && req.user.email && req.user.email.startsWith('guest_')) {
     return res.status(402).json({ error: 'guest_restricted', message: 'Please create an account to use this feature.' });
   }
-  
+
   try {
     const cacheRes = await pool.query(
       `SELECT comments_summary, summary_generated_at FROM articles WHERE hn_id = $1`,
@@ -495,14 +526,14 @@ RULES:
       if (err.response.status === 429) {
         return res.status(429).json({ error: 'rate_limited', message: 'The AI is currently resting due to high demand. Please try again later.' });
       }
-      // Pass the specific AI/API error back to the frontend for debugging
+      // Log full detail server-side only; keep the client-facing message generic.
       const apiErrorMsg = err.response.data?.error?.message || err.response.statusText || 'API Error';
       console.error(`API Error ${err.response.status}:`, apiErrorMsg);
-      return res.status(500).json({ error: 'api_error', message: `AI Service Error: ${apiErrorMsg}` });
+      return res.status(500).json({ error: 'api_error', message: 'AI summary service is temporarily unavailable. Please try again shortly.' });
     }
-    
+
     console.error('Error generating comment summary:', err.message);
-    res.status(500).json({ error: 'Failed to generate summary', message: err.message });
+    res.status(500).json({ error: 'Failed to generate summary', message: 'Failed to generate summary. Please try again shortly.' });
   }
 });
 
