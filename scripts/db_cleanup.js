@@ -1,14 +1,9 @@
 require('dotenv').config();
-const { Pool } = require('pg');
 const LanguageDetect = require('languagedetect');
+const pool = require('../db');
 
 const lngDetector = new LanguageDetect();
 lngDetector.setLanguageType('iso2'); // e.g. 'en'
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-});
 
 async function runCleanup() {
   const client = await pool.connect();

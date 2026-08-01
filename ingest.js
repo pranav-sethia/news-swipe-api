@@ -1,17 +1,11 @@
 require('dotenv').config();
 const axios = require('axios');
 const cheerio = require('cheerio');
-const { Pool } = require('pg');
+const pool = require('./db');
 
 const { pipeline } = require('@xenova/transformers');
 
 const OG_FETCH_TIMEOUT_MS = 4000;
-
-// Initialize Postgres Pool
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
 
 let extractor;
 async function getExtractor() {
