@@ -32,8 +32,9 @@ router.get('/api/feed', async (req, res) => {
     // Update user activity to track inactive accounts
     await pool.query('UPDATE users SET last_active = NOW() WHERE id = $1', [userId]).catch(err => console.error('Failed to update last_active:', err));
 
-    const userResult = await pool.query('SELECT taste_vector FROM users WHERE id = $1', [userId]);
+    const userResult = await pool.query('SELECT taste_vector, onboarding_categories FROM users WHERE id = $1', [userId]);
     const tasteVector = userResult.rows[0]?.taste_vector;
+    const onboardingCategories = userResult.rows[0]?.onboarding_categories || [];
 
     // Per-user category affinity: net likes minus dislikes per category.
     // Reused for the smart feed's ranking bonus and to keep the discovery
@@ -166,13 +167,14 @@ router.get('/api/feed', async (req, res) => {
       finalFeed = randomizedInterleave(smartRows, dumbRows);
 
     } else {
-      // New user: no personalization signal yet, so rank by a blend of recency
-      // and HN's own score instead of pure recency. Otherwise a just-posted,
-      // barely-upvoted story outranks something the community actually liked.
+      // New user: no swipe-derived signal yet, so rank by a blend of recency
+      // and HN's own score instead of pure recency (a just-posted, barely-
+      // upvoted story shouldn't outrank something the community actually
+      // liked), plus a bonus for whatever topics they picked at onboarding.
       console.log(`[V10] No taste_vector for user ${userId}, discovery feed`);
       const candidatePool = (await pool.query(`
         SELECT id, title, description, article_url, image_url, source_name, published_at,
-               score, num_comments, hn_id, read_time_minutes, NULL::float AS similarity_raw
+               score, num_comments, hn_id, read_time_minutes, category, NULL::float AS similarity_raw
         FROM articles
         WHERE NOT EXISTS (SELECT 1 FROM user_swipes us2 WHERE us2.user_id = $1 AND us2.article_id = articles.id)
           AND embedding IS NOT NULL
@@ -183,7 +185,9 @@ router.get('/api/feed', async (req, res) => {
       const nowMs = Date.now();
       candidatePool.forEach(r => {
         const ageHours = (nowMs - new Date(r.published_at).getTime()) / (1000 * 60 * 60);
-        r.discovery_score = -ageHours / 24 + Math.log1p(r.score || 0) * 2;
+        const onboardingBonus = onboardingCategories.includes(r.category) ? 3 : 0;
+        r.discovery_score = -ageHours / 24 + Math.log1p(r.score || 0) * 2 + onboardingBonus;
+        delete r.category; // internal only, not part of the article payload shape
       });
       candidatePool.sort((a, b) => a.discovery_score - b.discovery_score);
       // Weakest first (shown last), strongest last (shown first), matching the
