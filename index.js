@@ -1,4 +1,5 @@
 require('dotenv').config();
+const { Sentry, enabled: sentryEnabled } = require('./sentry');
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -39,6 +40,8 @@ app.use(feedRoutes);
 app.use(commentsRoutes);
 app.use(swipeRoutes);
 app.use(statsRoutes);
+
+if (sentryEnabled) Sentry.setupExpressErrorHandler(app);
 
 const startServer = async () => {
   try {
