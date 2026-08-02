@@ -36,17 +36,16 @@ async function getSummary(text, title) {
 TAXONOMY:
 - Software Engineering: Programming languages, web/mobile development, databases, algorithms, DevOps, infrastructure, open-source projects, game development, and software architecture.
 - Hardware & Systems: Semiconductors, GPUs, networking, servers, operating systems, embedded systems, robotics, IoT, self-driving technology, and consumer electronics (e.g., Apple hardware).
-- Artificial Intelligence: LLMs, machine learning, neural networks, computer vision, data science, NLP, and AI agents.
+- Artificial Intelligence: LLMs, machine learning, neural networks, computer vision, data science, NLP, and AI agents. Reserved for articles primarily about the technology, research, or techniques themselves.
 - Startups & VC: Early-stage companies, venture capital, fundraising, incubators (like YC), entrepreneurship, founders, and product management.
 - Cybersecurity: Vulnerabilities, hacking, zero-days, infosec, privacy laws, encryption (non-crypto), malware, and network security.
-- Business & Finance: Corporate acquisitions (M&A), earnings reports, stock market, tech industry economics, Big Tech antitrust/lawsuits, layoffs, FCC/FTC tech regulations, and enterprise pricing.
+- Business & Finance: Corporate acquisitions (M&A), earnings reports, stock market, tech industry economics, Big Tech antitrust/lawsuits, layoffs, FCC/FTC tech regulations, enterprise pricing, and blockchain/cryptocurrency business or regulatory news.
 - Science & Space: Physics, biology, biotech, medicine, astronomy, aerospace (e.g., SpaceX), mathematics, climate tech, and energy.
 - Design & UI/UX: Typography, frontend aesthetics, user experience research, human-computer interaction (HCI), and web accessibility.
-- Web3 & Crypto: Blockchains, cryptography protocols, cryptocurrencies, decentralization, and smart contracts.
 - Other: Use ONLY for purely non-tech/non-science/non-business topics, such as classical history, food recipes, random internet culture, DIY crafts, or personal storytelling.
 
 RULES:
-1. Determine the PRIMARY theme. If an article covers an AI startup raising money, the primary theme is Startups & VC.
+1. Determine the PRIMARY theme, not just mentioned keywords. If an article is fundamentally about a company's funding round, valuation, or other early-stage deal mechanics, classify it as Startups & VC, even when the company's product involves AI. If it is fundamentally about an acquisition, earnings, or other corporate/market news, classify it as Business & Finance, even when the company involved is an AI company. Reserve Artificial Intelligence for articles primarily about the technology, research, or techniques themselves, not company or deal news that happens to mention AI.
 2. You must provide your step-by-step reasoning BEFORE outputting the final category.
 3. Extract exactly 3 bullet points summarizing the article's core news value objectively. We have a strict UI width limit. Bullets MUST NOT exceed 60 characters in total length.
 4. To achieve this, write a draft, then aggressively condense it by removing articles (a, an, the) and using sentence fragments.
@@ -117,8 +116,14 @@ Rules for bullets: They MUST be fragments and MUST NOT exceed 60 characters.`;
       return `- ${text}`;
     }).join('\n');
 
-    const allowedCategories = ["Software Engineering", "Hardware & Systems", "Artificial Intelligence", "Startups & VC", "Cybersecurity", "Business & Finance", "Science & Space", "Design & UI/UX", "Web3 & Crypto", "Other"];
-    const finalCategory = allowedCategories.includes(parsed.category) ? parsed.category : "Other";
+    const allowedCategories = ["Software Engineering", "Hardware & Systems", "Artificial Intelligence", "Startups & VC", "Cybersecurity", "Business & Finance", "Science & Space", "Design & UI/UX", "Other"];
+    // Web3 & Crypto was merged into Business & Finance (too small a category to
+    // support a reliable ranking signal, see the taxonomy distribution check).
+    // The model shouldn't output it anymore given the prompt above, but remap
+    // defensively in case it does.
+    const finalCategory = parsed.category === "Web3 & Crypto"
+      ? "Business & Finance"
+      : (allowedCategories.includes(parsed.category) ? parsed.category : "Other");
     
     let validTags = Array.isArray(parsed.tags) ? parsed.tags.slice(0, 3).map(t => String(t).substring(0, 20)) : [];
     
@@ -226,9 +231,10 @@ async function extractArticleData(url) {
 }
 
 async function processArticles() {
-  console.log("Starting ingestion process...");
-  
-  const articles = await scrapeHackerNews();
+  try {
+    console.log("Starting ingestion process...");
+    
+    const articles = await scrapeHackerNews();
   
   for (const article of articles) {
     try {
@@ -303,8 +309,11 @@ async function processArticles() {
   }
 
 
-  console.log("Ingestion process complete.");
-  pool.end();
+    console.log("Ingestion process complete.");
+  } finally {
+    console.log("Closing DB connection...");
+    await pool.end();
+  }
 }
 
 processArticles();
