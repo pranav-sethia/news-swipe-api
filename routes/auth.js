@@ -94,7 +94,7 @@ router.post('/auth/login', authLimiter, async (req, res) => {
   }
 });
 
-// POST /auth/guest — creates an ephemeral, isolated guest account
+// POST /auth/guest, creates an ephemeral, isolated guest account
 router.post('/auth/guest', authLimiter, async (req, res) => {
   const guestUuid = crypto.randomUUID();
   const guestEmail = `guest_${guestUuid}@hackerswipe.io`;
@@ -123,7 +123,7 @@ router.post('/auth/guest', authLimiter, async (req, res) => {
   }
 });
 
-// POST /api/auth/google — verifies Google access_token and issues app JWT
+// POST /api/auth/google, verifies Google access_token and issues app JWT
 router.post('/api/auth/google', authLimiter, async (req, res) => {
   const { credential } = req.body; // access_token from redirect flow
   if (!credential) return res.status(400).json({ error: 'Missing credential' });

@@ -6,7 +6,7 @@ const { summaryPerUserLimiter, reserveGroqSummarySlot } = require('../middleware
 const router = express.Router();
 
 // GET /api/comments/:hnId/summary - Summarize Hacker News comments using Groq
-// authMiddleware isn't listed here — it's already applied to the whole /api prefix in index.js.
+// authMiddleware isn't listed here, it's already applied to the whole /api prefix in index.js.
 router.get('/api/comments/:hnId/summary', summaryPerUserLimiter, async (req, res) => {
   const { hnId } = req.params;
 
@@ -82,7 +82,7 @@ RULES:
     if (!process.env.GROQ_API_KEY) throw new Error("Missing GROQ_API_KEY");
 
     if (!reserveGroqSummarySlot()) {
-      return res.status(429).json({ error: 'rate_limited', message: 'AI summaries are in high demand right now — please try again in a minute.' });
+      return res.status(429).json({ error: 'rate_limited', message: 'AI summaries are in high demand right now. Please try again in a minute.' });
     }
 
     const groqRes = await axios.post('https://api.groq.com/openai/v1/chat/completions', {

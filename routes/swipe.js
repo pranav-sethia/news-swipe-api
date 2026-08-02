@@ -99,7 +99,7 @@ router.post('/api/swipe', async (req, res) => {
   }
 });
 
-// DELETE /api/swipe/:articleId — unlike/remove a swipe
+// DELETE /api/swipe/:articleId, unlike/remove a swipe
 router.delete('/api/swipe/:articleId', async (req, res) => {
   const userId = req.user.id;
   const { articleId } = req.params;

@@ -9,7 +9,7 @@ const ALLOWED_CATEGORIES = [
   'Design & UI/UX', 'Other',
 ];
 
-// POST /api/onboarding — save a new user's picked topics, used to bias their
+// POST /api/onboarding, save a new user's picked topics, used to bias their
 // cold-start feed before they have any swipe history.
 router.post('/api/onboarding', async (req, res) => {
   const userId = req.user.id;

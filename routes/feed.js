@@ -129,7 +129,7 @@ router.get('/api/feed', async (req, res) => {
       smartRows = selectedSmart;
 
       // 4. Label ALL smart articles with relative match % (72–99%).
-      //    Relative scoring means there are ALWAYS badges — no hard threshold that silently drops them.
+      //    Relative scoring means there are ALWAYS badges, no hard threshold that silently drops them.
       if (smartRows.length > 0) {
         smartRows.forEach(r => {
           const sim = parseFloat(r.similarity_raw);
@@ -163,7 +163,7 @@ router.get('/api/feed', async (req, res) => {
         LIMIT ${DUMB_FETCH}
       `, [userId, dislikedCategories])).rows;
 
-      // 6. Probabilistic interleave — no fixed pattern, randomized positions with constraints.
+      // 6. Probabilistic interleave, no fixed pattern, randomized positions with constraints.
       finalFeed = randomizedInterleave(smartRows, dumbRows);
 
     } else {

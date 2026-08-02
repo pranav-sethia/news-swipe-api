@@ -15,7 +15,7 @@ function cosineSimilarity(vecA, vecB) {
 // Splits the match pool into N equal windows (one per discovery card).
 // Within each window, the discovery card lands at a random position.
 // Guarantees: max consecutive matches ≤ windowSize (~4), never back-to-back discoveries,
-// and a different pattern every call — no hardcoded rhythm.
+// and a different pattern every call, no hardcoded rhythm.
 function randomizedInterleave(smartRows, dumbRows) {
   if (!dumbRows.length) return [...smartRows];
   if (!smartRows.length) return [...dumbRows];
