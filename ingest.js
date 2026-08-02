@@ -27,7 +27,9 @@ async function getEmbedding(text) {
 }
 
 async function getSummary(text, title) {
-  if (!text || text.length < 200) return null;
+  // 200 chars (~30 words) let near-empty scrapes (cookie banners, stub pages) through;
+  // 500 is closer to a real minimum paragraph of article content.
+  if (!text || text.length < 500) return null;
 
   try {
     const systemPrompt = `You are a precision taxonomy and classification engine for a technology news aggregator. Your task is to analyze the provided text and output a JSON object.`;
@@ -159,7 +161,7 @@ async function scrapeHackerNews() {
       // Fetch details
       const itemRes = await axios.get(`https://hacker-news.firebaseio.com/v0/item/${id}.json`);
       const item = itemRes.data;
-      if (!item || item.type !== 'story' || !item.url) continue;
+      if (!item || item.dead || item.deleted || item.type !== 'story' || !item.url) continue;
       
       newArticles.push({
         hn_id: String(item.id),
