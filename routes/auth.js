@@ -5,6 +5,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 const pool = require('../db');
 const { authLimiter } = require('../middleware/rateLimiters');
+const { sendPasswordResetEmail } = require('../email');
 
 const router = express.Router();
 
@@ -90,6 +91,68 @@ router.post('/auth/login', authLimiter, async (req, res) => {
     );
   } catch (err) {
     console.error('Error during login:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /auth/forgot-password, emails a reset link if the address matches an account.
+// Always returns the same generic response so this can't be used to check
+// whether a given email has an account here.
+router.post('/auth/forgot-password', authLimiter, async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email is required.' });
+
+  const genericResponse = { message: "If an account exists for that email, we've sent a reset link." };
+
+  try {
+    const { rows } = await pool.query('SELECT id, email FROM users WHERE email = $1', [email]);
+    const user = rows[0];
+    if (user) {
+      const rawToken = crypto.randomBytes(32).toString('hex');
+      const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+      const expires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+      await pool.query(
+        'UPDATE users SET reset_token_hash = $1, reset_token_expires = $2 WHERE id = $3',
+        [tokenHash, expires, user.id]
+      );
+
+      const frontendUrl = (process.env.FRONTEND_URL || '').split(',')[0].trim() || 'http://localhost:5173';
+      const resetUrl = `${frontendUrl}/reset-password?token=${rawToken}`;
+      await sendPasswordResetEmail(user.email, resetUrl);
+    }
+    res.json(genericResponse);
+  } catch (err) {
+    console.error('Error in forgot-password:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// POST /auth/reset-password, consumes a reset token minted above
+router.post('/auth/reset-password', authLimiter, async (req, res) => {
+  const { token, password } = req.body;
+  if (!token || !password) return res.status(400).json({ error: 'Token and new password are required.' });
+  if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters long.' });
+
+  try {
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const { rows } = await pool.query(
+      'SELECT id FROM users WHERE reset_token_hash = $1 AND reset_token_expires > NOW()',
+      [tokenHash]
+    );
+    const user = rows[0];
+    if (!user) {
+      return res.status(400).json({ error: 'This reset link is invalid or has expired.' });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const passwordHash = await bcrypt.hash(password, salt);
+    await pool.query(
+      'UPDATE users SET password_hash = $1, reset_token_hash = NULL, reset_token_expires = NULL WHERE id = $2',
+      [passwordHash, user.id]
+    );
+    res.json({ message: 'Password updated. You can now sign in.' });
+  } catch (err) {
+    console.error('Error in reset-password:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
