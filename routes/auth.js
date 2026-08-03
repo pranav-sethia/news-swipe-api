@@ -1,13 +1,14 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const axios = require('axios');
 const crypto = require('crypto');
+const { OAuth2Client } = require('google-auth-library');
 const pool = require('../db');
 const { authLimiter } = require('../middleware/rateLimiters');
 const { sendPasswordResetEmail, sendGoogleAccountNoticeEmail } = require('../email');
 
 const router = express.Router();
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 router.post('/auth/register', authLimiter, async (req, res) => {
   const { email, password } = req.body;
@@ -218,10 +219,18 @@ router.post('/auth/guest', authLimiter, async (req, res) => {
   }
 });
 
-// POST /api/auth/google, verifies Google access_token and issues app JWT
+// POST /api/auth/google, verifies a Google ID token and issues an app JWT.
+// Verifies the token was actually minted for THIS app's OAuth client (aud
+// check) - previously this just called Google's generic userinfo endpoint
+// with a client-supplied access_token, which never confirmed the token was
+// issued to us specifically. Any valid Google access token from any OAuth
+// client (e.g. one a victim authorized for an unrelated app) could be
+// replayed here to sign in as that person. verifyIdToken's audience check
+// closes that gap. The nonce check additionally guards against replaying an
+// intercepted id_token from a genuine prior login attempt.
 router.post('/api/auth/google', authLimiter, async (req, res) => {
-  const { credential } = req.body; // access_token from redirect flow
-  if (!credential) return res.status(400).json({ error: 'Missing credential' });
+  const { idToken, nonce } = req.body;
+  if (!idToken) return res.status(400).json({ error: 'Missing credential' });
 
   // If this call carries an active guest session's token, a first-time
   // Google signup can upgrade that same row in place (preserving
@@ -240,17 +249,29 @@ router.post('/api/auth/google', authLimiter, async (req, res) => {
   }
 
   try {
-    // Ping Google to verify token and get user profile
-    const { data: googleUser } = await axios.get('https://www.googleapis.com/oauth2/v3/userinfo', {
-      headers: { Authorization: `Bearer ${credential}` }
+    const ticket = await googleClient.verifyIdToken({
+      idToken,
+      audience: process.env.GOOGLE_CLIENT_ID,
     });
+    const payload = ticket.getPayload();
 
-    const email = googleUser.email;
+    if (!payload.email_verified) {
+      return res.status(401).json({ error: 'Your Google email is not verified.' });
+    }
+    if (nonce && payload.nonce !== nonce) {
+      return res.status(401).json({ error: 'Invalid Google Token' });
+    }
+
+    const email = payload.email;
     if (!email) throw new Error('No email found in Google token');
 
     // Check if user exists
     let { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     let user = rows[0];
+    // Lets the frontend know whether to route through onboarding's category
+    // picker - only relevant the first time this account exists, never on a
+    // returning login.
+    let isNewUser = false;
 
     if (!user && guestId) {
       // First-time Google signup starting from a guest session: upgrade the
@@ -263,7 +284,10 @@ router.post('/api/auth/google', authLimiter, async (req, res) => {
         [email, guestId]
       );
       user = updated.rows[0];
-      if (user) console.log(`✅ Guest user ${guestId} upgraded to Google account: ${email}`);
+      if (user) {
+        isNewUser = true;
+        console.log(`✅ Guest user ${guestId} upgraded to Google account: ${email}`);
+      }
     }
 
     // If no user, create one securely with a random unguessable password hash
@@ -276,6 +300,7 @@ router.post('/api/auth/google', authLimiter, async (req, res) => {
         [email, hash]
       );
       user = inserted.rows[0];
+      isNewUser = true;
       console.log(`✅ Google SSO account created for ${email}`);
     } else if (user.auth_provider !== 'google') {
       // This email already has a real password account. Don't silently
@@ -290,7 +315,7 @@ router.post('/api/auth/google', authLimiter, async (req, res) => {
     const jwtPayload = { user: { id: user.id, email: user.email } };
     jwt.sign(jwtPayload, process.env.JWT_SECRET, { expiresIn: '7d' }, (err, token) => {
       if (err) throw err;
-      res.json({ token, user: { id: user.id, email: user.email } });
+      res.json({ token, user: { id: user.id, email: user.email }, isNewUser });
     });
   } catch (err) {
     console.error('Google Auth verification failed:', err);
