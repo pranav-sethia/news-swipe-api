@@ -228,15 +228,12 @@ router.post('/api/auth/google', authLimiter, async (req, res) => {
       user = inserted.rows[0];
       console.log(`✅ Google SSO account created for ${email}`);
     } else if (user.auth_provider !== 'google') {
-      // Self-heal accounts that were actually created via Google before
-      // auth_provider existed (it defaulted to 'password' for every
-      // pre-existing row when that column was added) - anyone who
-      // successfully completes this route is a Google account, full stop.
-      const updated = await pool.query(
-        "UPDATE users SET auth_provider = 'google' WHERE id = $1 RETURNING *",
-        [user.id]
-      );
-      user = updated.rows[0];
+      // This email already has a real password account. Don't silently
+      // convert it to Google - that would make the password stop working
+      // with zero warning, and the person may specifically prefer keeping
+      // it. Tell them to use it instead, mirroring the reverse case in
+      // /auth/login.
+      return res.status(401).json({ error: 'This email already has a password account. Sign in with your password instead.' });
     }
 
     // Issue standard JWT
