@@ -203,6 +203,22 @@ router.post('/api/auth/google', authLimiter, async (req, res) => {
   const { credential } = req.body; // access_token from redirect flow
   if (!credential) return res.status(400).json({ error: 'Missing credential' });
 
+  // If this call carries an active guest session's token, a first-time
+  // Google signup can upgrade that same row in place (preserving
+  // user_swipes/taste_vector) instead of creating an unrelated new user -
+  // mirrors the same guest-upgrade check in /auth/register.
+  let guestId = null;
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.split(' ')[1];
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
+      if (decoded && decoded.user && decoded.user.isGuest) {
+        guestId = decoded.user.id;
+      }
+    } catch (err) { /* ignore invalid/expired token */ }
+  }
+
   try {
     // Ping Google to verify token and get user profile
     const { data: googleUser } = await axios.get('https://www.googleapis.com/oauth2/v3/userinfo', {
@@ -215,6 +231,20 @@ router.post('/api/auth/google', authLimiter, async (req, res) => {
     // Check if user exists
     let { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     let user = rows[0];
+
+    if (!user && guestId) {
+      // First-time Google signup starting from a guest session: upgrade the
+      // guest's existing row in place instead of inserting a disconnected
+      // new user, so their swipes/taste_vector aren't lost. Falls through to
+      // the normal insert below if the guest row no longer exists (e.g.
+      // already cleaned up).
+      const updated = await pool.query(
+        "UPDATE users SET email = $1, auth_provider = 'google' WHERE id = $2 RETURNING *",
+        [email, guestId]
+      );
+      user = updated.rows[0];
+      if (user) console.log(`✅ Guest user ${guestId} upgraded to Google account: ${email}`);
+    }
 
     // If no user, create one securely with a random unguessable password hash
     if (!user) {
