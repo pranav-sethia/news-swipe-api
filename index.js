@@ -12,6 +12,7 @@ const commentsRoutes = require('./routes/comments');
 const swipeRoutes = require('./routes/swipe');
 const statsRoutes = require('./routes/stats');
 const onboardingRoutes = require('./routes/onboarding');
+const accountRoutes = require('./routes/account');
 
 const app = express();
 const port = process.env.PORT || 4000;
@@ -42,6 +43,7 @@ app.use(commentsRoutes);
 app.use(swipeRoutes);
 app.use(statsRoutes);
 app.use(onboardingRoutes);
+app.use(accountRoutes);
 
 if (sentryEnabled) Sentry.setupExpressErrorHandler(app);
 
