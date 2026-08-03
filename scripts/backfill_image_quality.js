@@ -1,6 +1,7 @@
 require('dotenv').config();
 const sharp = require('sharp');
 const pool = require('../db');
+const { safeFetch, readWithSizeLimit, DEFAULT_MAX_BYTES } = require('../utils/safeFetch');
 
 const IMAGE_CHECK_TIMEOUT_MS = 5000;
 const MIN_IMAGE_DIMENSION = 200;
@@ -13,11 +14,11 @@ async function isImageGoodQuality(imageUrl) {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), IMAGE_CHECK_TIMEOUT_MS);
-    const res = await fetch(imageUrl, { signal: controller.signal });
+    const res = await safeFetch(imageUrl, { signal: controller.signal });
     clearTimeout(timeout);
     if (!res.ok) return false;
 
-    const buffer = Buffer.from(await res.arrayBuffer());
+    const buffer = await readWithSizeLimit(res, DEFAULT_MAX_BYTES);
     const image = sharp(buffer);
     const metadata = await image.metadata();
     if (!metadata.width || !metadata.height || metadata.width < MIN_IMAGE_DIMENSION || metadata.height < MIN_IMAGE_DIMENSION) {

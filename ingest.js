@@ -3,6 +3,7 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const sharp = require('sharp');
 const pool = require('./db');
+const { safeFetch, readWithSizeLimit, DEFAULT_MAX_BYTES } = require('./utils/safeFetch');
 
 const { pipeline } = require('@xenova/transformers');
 
@@ -23,11 +24,11 @@ async function isImageGoodQuality(imageUrl) {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), IMAGE_CHECK_TIMEOUT_MS);
-    const res = await fetch(imageUrl, { signal: controller.signal });
+    const res = await safeFetch(imageUrl, { signal: controller.signal });
     clearTimeout(timeout);
     if (!res.ok) return false;
 
-    const buffer = Buffer.from(await res.arrayBuffer());
+    const buffer = await readWithSizeLimit(res, DEFAULT_MAX_BYTES);
     const image = sharp(buffer);
     const metadata = await image.metadata();
     if (!metadata.width || !metadata.height || metadata.width < MIN_IMAGE_DIMENSION || metadata.height < MIN_IMAGE_DIMENSION) {
@@ -225,11 +226,15 @@ async function extractArticleData(url) {
   }
 
   try {
-    const response = await axios.get(url, { 
-      timeout: OG_FETCH_TIMEOUT_MS,
-      headers: { 'User-Agent': 'Mozilla/5.0' } 
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), OG_FETCH_TIMEOUT_MS);
+    const response = await safeFetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: controller.signal,
     });
-    const html = response.data;
+    clearTimeout(timeout);
+    if (!response.ok) return null;
+    const html = (await readWithSizeLimit(response, DEFAULT_MAX_BYTES)).toString('utf-8');
     const $ = cheerio.load(html);
 
     let imageUrl = $('meta[property="og:image"]').attr('content');
