@@ -227,6 +227,16 @@ router.post('/api/auth/google', authLimiter, async (req, res) => {
       );
       user = inserted.rows[0];
       console.log(`✅ Google SSO account created for ${email}`);
+    } else if (user.auth_provider !== 'google') {
+      // Self-heal accounts that were actually created via Google before
+      // auth_provider existed (it defaulted to 'password' for every
+      // pre-existing row when that column was added) - anyone who
+      // successfully completes this route is a Google account, full stop.
+      const updated = await pool.query(
+        "UPDATE users SET auth_provider = 'google' WHERE id = $1 RETURNING *",
+        [user.id]
+      );
+      user = updated.rows[0];
     }
 
     // Issue standard JWT
