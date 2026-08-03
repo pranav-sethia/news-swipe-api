@@ -139,6 +139,26 @@ router.post('/auth/forgot-password', authLimiter, async (req, res) => {
   }
 });
 
+// GET /auth/reset-token-valid, lets the reset-password page check a token
+// up front instead of only finding out it's dead/expired/already-used when
+// the user submits a new password.
+router.get('/auth/reset-token-valid', authLimiter, async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.json({ valid: false });
+
+  try {
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const { rows } = await pool.query(
+      'SELECT id FROM users WHERE reset_token_hash = $1 AND reset_token_expires > NOW()',
+      [tokenHash]
+    );
+    res.json({ valid: rows.length > 0 });
+  } catch (err) {
+    console.error('Error in reset-token-valid:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // POST /auth/reset-password, consumes a reset token minted above
 router.post('/auth/reset-password', authLimiter, async (req, res) => {
   const { token, password } = req.body;
