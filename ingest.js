@@ -1,11 +1,47 @@
 require('dotenv').config();
 const axios = require('axios');
 const cheerio = require('cheerio');
+const sharp = require('sharp');
 const pool = require('./db');
 
 const { pipeline } = require('@xenova/transformers');
 
 const OG_FETCH_TIMEOUT_MS = 4000;
+const IMAGE_CHECK_TIMEOUT_MS = 5000;
+const MIN_IMAGE_DIMENSION = 200;
+// Calibrated against a real near-black Twitter video-thumbnail placeholder
+// (mean ~3) vs. legitimate article images (mean 85-245) - comfortably below
+// even a moody/dark real photo, comfortably above a placeholder frame.
+const MIN_MEAN_BRIGHTNESS = 30;
+
+// Reject images that are too dark or too small to be a real hero photo,
+// rather than let a bad og:image/twitter:image (often a near-black video
+// placeholder frame on link-card posts) get stored and shown like a real
+// photo. Fails safe to "reject" on any error - an image we couldn't verify
+// shouldn't be trusted over the curated fallback textures.
+async function isImageGoodQuality(imageUrl) {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), IMAGE_CHECK_TIMEOUT_MS);
+    const res = await fetch(imageUrl, { signal: controller.signal });
+    clearTimeout(timeout);
+    if (!res.ok) return false;
+
+    const buffer = Buffer.from(await res.arrayBuffer());
+    const image = sharp(buffer);
+    const metadata = await image.metadata();
+    if (!metadata.width || !metadata.height || metadata.width < MIN_IMAGE_DIMENSION || metadata.height < MIN_IMAGE_DIMENSION) {
+      return false;
+    }
+
+    const stats = await image.stats();
+    const channels = stats.channels.slice(0, 3);
+    const meanBrightness = channels.reduce((sum, c) => sum + c.mean, 0) / channels.length;
+    return meanBrightness >= MIN_MEAN_BRIGHTNESS;
+  } catch {
+    return false;
+  }
+}
 
 let extractor;
 async function getExtractor() {
@@ -199,6 +235,9 @@ async function extractArticleData(url) {
     let imageUrl = $('meta[property="og:image"]').attr('content');
     if (!imageUrl) {
       imageUrl = $('meta[name="twitter:image"]').attr('content');
+    }
+    if (imageUrl && !(await isImageGoodQuality(imageUrl))) {
+      imageUrl = null;
     }
 
     let sourceName = $('meta[property="og:site_name"]').attr('content');
