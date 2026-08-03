@@ -77,7 +77,7 @@ router.get('/api/liked-articles', async (req, res) => {
 
   try {
     const query = `
-      SELECT a.id, a.title, a.article_url, a.source_name
+      SELECT a.id, a.title, a.article_url, a.source_name, a.image_url, a.category, a.score, a.read_time_minutes, us.swipe_time
       FROM articles a
       JOIN user_swipes us ON a.id = us.article_id
       WHERE us.user_id = $1 AND us.liked = true
