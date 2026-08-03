@@ -17,6 +17,12 @@ const accountRoutes = require('./routes/account');
 const app = express();
 const port = process.env.PORT || 4000;
 
+// Render (and most PaaS hosts) sit one reverse-proxy hop in front of this
+// process. Without this, express-rate-limit's default IP key resolves to
+// the proxy's own address for every request, collapsing every real user
+// into one shared rate-limit bucket.
+app.set('trust proxy', 1);
+
 // --- Middleware ---
 // Supports a single origin or a comma-separated list, e.g. "https://hackerswipe.io,https://www.hackerswipe.io"
 const allowedOrigins = (process.env.FRONTEND_URL || '*').split(',').map(o => o.trim()).filter(Boolean);

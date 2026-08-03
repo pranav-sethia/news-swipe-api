@@ -1,5 +1,6 @@
 const express = require('express');
 const pool = require('../db');
+const { apiActionLimiter } = require('../middleware/rateLimiters');
 
 const router = express.Router();
 
@@ -18,7 +19,7 @@ function normalize(vec) {
 }
 
 // POST /api/swipe
-router.post('/api/swipe', async (req, res) => {
+router.post('/api/swipe', apiActionLimiter, async (req, res) => {
   const userId = req.user.id;
   const { articleId, liked } = req.body;
   if (!articleId || liked === undefined) {
@@ -100,7 +101,7 @@ router.post('/api/swipe', async (req, res) => {
 });
 
 // DELETE /api/swipe/:articleId, unlike/remove a swipe
-router.delete('/api/swipe/:articleId', async (req, res) => {
+router.delete('/api/swipe/:articleId', apiActionLimiter, async (req, res) => {
   const userId = req.user.id;
   const { articleId } = req.params;
   try {
@@ -169,7 +170,7 @@ router.delete('/api/swipe/:articleId', async (req, res) => {
 });
 
 // POST /api/reset
-router.post('/api/reset', async (req, res) => {
+router.post('/api/reset', apiActionLimiter, async (req, res) => {
   const userId = req.user.id;
   try {
     await pool.query('DELETE FROM user_swipes WHERE user_id = $1', [userId]);

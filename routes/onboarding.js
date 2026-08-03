@@ -1,5 +1,6 @@
 const express = require('express');
 const pool = require('../db');
+const { apiActionLimiter } = require('../middleware/rateLimiters');
 
 const router = express.Router();
 
@@ -11,7 +12,7 @@ const ALLOWED_CATEGORIES = [
 
 // POST /api/onboarding, save a new user's picked topics, used to bias their
 // cold-start feed before they have any swipe history.
-router.post('/api/onboarding', async (req, res) => {
+router.post('/api/onboarding', apiActionLimiter, async (req, res) => {
   const userId = req.user.id;
   const categories = Array.isArray(req.body.categories)
     ? req.body.categories.filter((c) => ALLOWED_CATEGORIES.includes(c))

@@ -1,6 +1,7 @@
 const express = require('express');
 const pool = require('../db');
 const { cosineSimilarity, randomizedInterleave } = require('../utils/matching');
+const { apiActionLimiter } = require('../middleware/rateLimiters');
 
 const router = express.Router();
 
@@ -23,7 +24,7 @@ function scoreBonus(score) {
 }
 
 // GET /api/feed (V10, EMA + Probabilistic Interleave)
-router.get('/api/feed', async (req, res) => {
+router.get('/api/feed', apiActionLimiter, async (req, res) => {
   const userId = req.user.id;
   const SMART_FETCH = 12; // all labelled as MATCH
   const DUMB_FETCH  = 3;  // ~20% serendipity
@@ -149,19 +150,18 @@ router.get('/api/feed', async (req, res) => {
       //    categories they've already told us (via net dislikes) they don't want.
       //    Random discovery shouldn't mean "show them what they just disliked".
       const smartIds = smartRows.map(a => a.id);
-      const idBlock  = smartIds.length ? smartIds.join(',') : '0';
       const dumbRows = (await pool.query(`
         SELECT id, title, description, article_url, image_url, source_name, published_at,
                score, num_comments, hn_id, read_time_minutes, NULL::float AS similarity_raw
         FROM articles
         WHERE NOT EXISTS (SELECT 1 FROM user_swipes us2 WHERE us2.user_id = $1 AND us2.article_id = articles.id)
-          AND id NOT IN (${idBlock})
+          AND NOT (id = ANY($2::int[]))
           AND embedding IS NOT NULL
           AND published_at::timestamp > NOW() - INTERVAL '7 days'
-          AND (category IS NULL OR NOT (category = ANY($2::text[])))
+          AND (category IS NULL OR NOT (category = ANY($3::text[])))
         ORDER BY RANDOM()
         LIMIT ${DUMB_FETCH}
-      `, [userId, dislikedCategories])).rows;
+      `, [userId, smartIds, dislikedCategories])).rows;
 
       // 6. Probabilistic interleave, no fixed pattern, randomized positions with constraints.
       finalFeed = randomizedInterleave(smartRows, dumbRows);

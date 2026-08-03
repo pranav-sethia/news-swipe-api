@@ -43,4 +43,18 @@ function reserveGroqSummarySlot() {
   return true;
 }
 
-module.exports = { authLimiter, summaryPerUserLimiter, reserveGroqSummarySlot };
+// General per-user cap for the core app endpoints (feed/swipe/account/onboarding).
+// None of these had any rate limiting before - /api/feed in particular runs a
+// pgvector ANN query plus a lateral join per call, so an unthrottled scripted
+// account could drive real Neon compute cost. Generous enough that no real
+// user swiping normally would ever notice it.
+const apiActionLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => String(req.user.id), // authMiddleware runs first, so req.user is always set here
+  message: { error: 'rate_limited', message: 'Too many requests. Please slow down.' },
+});
+
+module.exports = { authLimiter, summaryPerUserLimiter, apiActionLimiter, reserveGroqSummarySlot };
