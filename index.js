@@ -59,6 +59,7 @@ const startServer = async () => {
     await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_categories TEXT[];');
     await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_hash TEXT;');
     await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires TIMESTAMPTZ;');
+    await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider TEXT NOT NULL DEFAULT 'password';");
     await client.query('CREATE INDEX IF NOT EXISTS articles_embedding_idx ON articles USING hnsw (embedding vector_cosine_ops);');
     console.log(`✅ Schema updated with pgvector support and HNSW index.`);
 

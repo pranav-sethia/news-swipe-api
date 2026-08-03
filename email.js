@@ -28,4 +28,23 @@ async function sendPasswordResetEmail(to, resetUrl) {
   });
 }
 
-module.exports = { sendPasswordResetEmail, enabled };
+async function sendGoogleAccountNoticeEmail(to) {
+  if (!enabled) {
+    console.info(`Email disabled, would have told ${to} their account uses Google Sign-In.`);
+    return;
+  }
+  await resend.emails.send({
+    from: FROM,
+    to,
+    subject: 'About your HackerSwipe password reset request',
+    html: `
+      <div style="font-family: monospace; background: #080808; color: #e8e8e8; padding: 32px;">
+        <p style="color: #ff6600; font-weight: bold; letter-spacing: 1px;">HACKERSWIPE</p>
+        <p>Someone requested a password reset for this email, but this account was created with Google Sign-In and doesn't have a password.</p>
+        <p>Just sign in with Google instead. If this wasn't you, no action is needed.</p>
+      </div>
+    `,
+  });
+}
+
+module.exports = { sendPasswordResetEmail, sendGoogleAccountNoticeEmail, enabled };

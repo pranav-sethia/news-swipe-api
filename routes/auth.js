@@ -5,7 +5,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 const pool = require('../db');
 const { authLimiter } = require('../middleware/rateLimiters');
-const { sendPasswordResetEmail } = require('../email');
+const { sendPasswordResetEmail, sendGoogleAccountNoticeEmail } = require('../email');
 
 const router = express.Router();
 
@@ -56,6 +56,10 @@ router.post('/auth/register', authLimiter, async (req, res) => {
     );
   } catch (err) {
     if (err.code === '23505') {
+      const { rows } = await pool.query('SELECT auth_provider FROM users WHERE email = $1', [email]);
+      if (rows[0]?.auth_provider === 'google') {
+        return res.status(400).json({ error: 'This email already has a Google account. Sign in with Google instead.' });
+      }
       return res.status(400).json({ error: 'Email already in use.' });
     }
     console.error('Error during registration:', err);
@@ -74,6 +78,9 @@ router.post('/auth/login', authLimiter, async (req, res) => {
     const user = rows[0];
     if (!user) {
       return res.status(401).json({ error: 'Invalid credentials.' });
+    }
+    if (user.auth_provider === 'google') {
+      return res.status(401).json({ error: 'This email is linked to Google Sign-In. Continue with Google instead.' });
     }
     const isMatch = await bcrypt.compare(password, user.password_hash);
     if (!isMatch) {
@@ -105,9 +112,14 @@ router.post('/auth/forgot-password', authLimiter, async (req, res) => {
   const genericResponse = { message: "If an account exists for that email, we've sent a reset link." };
 
   try {
-    const { rows } = await pool.query('SELECT id, email FROM users WHERE email = $1', [email]);
+    const { rows } = await pool.query('SELECT id, email, auth_provider FROM users WHERE email = $1', [email]);
     const user = rows[0];
-    if (user) {
+    if (user && user.auth_provider === 'google') {
+      // Same generic HTTP response either way, so this can't be used to probe
+      // which emails have accounts here or how they signed up. The actual
+      // owner finds out what's going on via the email itself.
+      await sendGoogleAccountNoticeEmail(user.email);
+    } else if (user) {
       const rawToken = crypto.randomBytes(32).toString('hex');
       const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
       const expires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
@@ -210,7 +222,7 @@ router.post('/api/auth/google', authLimiter, async (req, res) => {
       const salt = await bcrypt.genSalt(10);
       const hash = await bcrypt.hash(dummyPassword, salt);
       const inserted = await pool.query(
-        'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING *',
+        "INSERT INTO users (email, password_hash, auth_provider) VALUES ($1, $2, 'google') RETURNING *",
         [email, hash]
       );
       user = inserted.rows[0];
