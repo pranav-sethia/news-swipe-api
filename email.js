@@ -8,12 +8,21 @@ if (!enabled) {
   console.info('Email sending disabled: set RESEND_API_KEY to enable.');
 }
 
+// The Resend SDK does not throw on API-level failures (bad recipient, sandbox
+// domain restrictions, etc.) - it resolves with { data, error }. Not checking
+// that meant a failed send looked identical to a successful one.
+function logIfFailed(result, context) {
+  if (result?.error) {
+    console.error(`Failed to send email (${context}):`, result.error);
+  }
+}
+
 async function sendPasswordResetEmail(to, resetUrl) {
   if (!enabled) {
     console.info(`Email disabled, would have sent password reset link to ${to}: ${resetUrl}`);
     return;
   }
-  await resend.emails.send({
+  const result = await resend.emails.send({
     from: FROM,
     to,
     subject: 'Reset your HackerSwipe password',
@@ -26,6 +35,7 @@ async function sendPasswordResetEmail(to, resetUrl) {
       </div>
     `,
   });
+  logIfFailed(result, 'password reset');
 }
 
 async function sendGoogleAccountNoticeEmail(to) {
@@ -33,7 +43,7 @@ async function sendGoogleAccountNoticeEmail(to) {
     console.info(`Email disabled, would have told ${to} their account uses Google Sign-In.`);
     return;
   }
-  await resend.emails.send({
+  const result = await resend.emails.send({
     from: FROM,
     to,
     subject: 'About your HackerSwipe password reset request',
@@ -45,6 +55,7 @@ async function sendGoogleAccountNoticeEmail(to) {
       </div>
     `,
   });
+  logIfFailed(result, 'google account notice');
 }
 
 module.exports = { sendPasswordResetEmail, sendGoogleAccountNoticeEmail, enabled };
