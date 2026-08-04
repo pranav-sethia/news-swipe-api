@@ -5,6 +5,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const pool = require('./db');
 const authMiddleware = require('./authMiddleware');
+const { authLimiter } = require('./middleware/rateLimiters');
 
 const authRoutes = require('./routes/auth');
 const feedRoutes = require('./routes/feed');
@@ -38,6 +39,17 @@ app.use(express.json());
 
 // --- Health Check (Keep-Alive) ---
 app.get('/api/health', (req, res) => res.status(200).send('OK'));
+
+// --- Public stats (no auth), a real proof-of-life number for the landing page ---
+app.get('/api/stats/public', authLimiter, async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT COUNT(*)::int AS count FROM articles');
+    res.json({ articleCount: rows[0].count });
+  } catch (err) {
+    console.error('Error fetching public stats:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 // --- AUTH ENDPOINTS (Public) ---
 app.use(authRoutes);
