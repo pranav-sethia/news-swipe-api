@@ -276,10 +276,44 @@ async function extractArticleData(url) {
   }
 }
 
+// HN score/comment counts move the most in the first ~72h after posting.
+// The main ingest loop only ever INSERTs a story once (see the existsResult
+// skip below), so without this those numbers would stay frozen at whatever
+// they were at first ingest for the rest of the article's life in the feed.
+// Uses the same free, unauthenticated HN item API as scrapeHackerNews - no
+// Groq involvement, so no rate-limit interaction.
+const REFRESH_WINDOW_HOURS = 72;
+
+async function refreshRecentEngagement() {
+  console.log("Refreshing score/comment counts for recent articles...");
+  const { rows } = await pool.query(
+    `SELECT hn_id FROM articles WHERE published_at > NOW() - INTERVAL '${REFRESH_WINDOW_HOURS} hours'`
+  );
+
+  let updated = 0;
+  for (const { hn_id } of rows) {
+    try {
+      const itemRes = await axios.get(`https://hacker-news.firebaseio.com/v0/item/${hn_id}.json`);
+      const item = itemRes.data;
+      if (!item) continue;
+      await pool.query(
+        'UPDATE articles SET score = $1, num_comments = $2 WHERE hn_id = $3',
+        [item.score || 0, item.descendants || 0, hn_id]
+      );
+      updated++;
+    } catch (error) {
+      console.error(`Failed to refresh engagement for hn_id ${hn_id}:`, error.message);
+    }
+  }
+  console.log(`Refreshed engagement for ${updated}/${rows.length} recent articles.`);
+}
+
 async function processArticles() {
   try {
     console.log("Starting ingestion process...");
-    
+
+    await refreshRecentEngagement().catch(error => console.error("Error refreshing recent engagement:", error.message));
+
     const articles = await scrapeHackerNews();
   
   for (const article of articles) {

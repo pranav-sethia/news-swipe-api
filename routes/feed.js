@@ -27,7 +27,8 @@ function scoreBonus(score) {
 router.get('/api/feed', apiActionLimiter, async (req, res) => {
   const userId = req.user.id;
   const SMART_FETCH = 12; // all labelled as MATCH
-  const DUMB_FETCH  = 3;  // ~20% serendipity
+  const DUMB_FETCH  = 3;  // ~20% serendipity, random discovery
+  const POPULAR_FETCH = 2; // taste-independent - the biggest HN stories, so a strong match vector never fully buries them
 
   try {
     // Update user activity to track inactive accounts
@@ -162,9 +163,28 @@ router.get('/api/feed', apiActionLimiter, async (req, res) => {
         ORDER BY RANDOM()
         LIMIT ${DUMB_FETCH}
       `, [userId, smartIds, dislikedCategories])).rows;
+      dumbRows.forEach(r => { r.discovery_type = 'random'; });
+
+      // 5b. Popular: the biggest HN stories by real engagement, regardless of
+      //     taste match - so a strong match vector never fully buries a story
+      //     everyone's talking about just because it isn't this user's usual topic.
+      const excludedIds = [...smartIds, ...dumbRows.map(r => r.id)];
+      const popularRows = (await pool.query(`
+        SELECT id, title, description, article_url, image_url, source_name, published_at,
+               score, num_comments, hn_id, read_time_minutes, NULL::float AS similarity_raw
+        FROM articles
+        WHERE NOT EXISTS (SELECT 1 FROM user_swipes us2 WHERE us2.user_id = $1 AND us2.article_id = articles.id)
+          AND NOT (id = ANY($2::int[]))
+          AND embedding IS NOT NULL
+          AND published_at::timestamp > NOW() - INTERVAL '7 days'
+          AND (category IS NULL OR NOT (category = ANY($3::text[])))
+        ORDER BY score DESC, num_comments DESC
+        LIMIT ${POPULAR_FETCH}
+      `, [userId, excludedIds, dislikedCategories])).rows;
+      popularRows.forEach(r => { r.discovery_type = 'popular'; });
 
       // 6. Probabilistic interleave, no fixed pattern, randomized positions with constraints.
-      finalFeed = randomizedInterleave(smartRows, dumbRows);
+      finalFeed = randomizedInterleave(smartRows, [...dumbRows, ...popularRows]);
 
     } else {
       // New user: no swipe-derived signal yet, so rank by a blend of recency
