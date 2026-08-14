@@ -1,9 +1,28 @@
 const express = require('express');
 const axios = require('axios');
 const pool = require('../db');
-const { summaryPerUserLimiter, reserveGroqSummarySlot } = require('../middleware/rateLimiters');
+const { summaryPerUserLimiter, reserveGroqSummarySlot, apiActionLimiter } = require('../middleware/rateLimiters');
 
 const router = express.Router();
+
+// GET /api/comments/:hnId/raw - proxies the raw comment thread server-side.
+// The frontend used to call hn.algolia.com directly from the browser - the
+// only data call in the app that bypassed this backend. Same response shape
+// (top-level `children`) so CommentsDrawer.jsx's existing parsing logic is
+// unchanged, just pointed at this route instead.
+router.get('/api/comments/:hnId/raw', apiActionLimiter, async (req, res) => {
+  const { hnId } = req.params;
+  if (!/^\d+$/.test(hnId)) {
+    return res.status(400).json({ error: 'Invalid hnId' });
+  }
+  try {
+    const algoliaRes = await axios.get(`https://hn.algolia.com/api/v1/items/${hnId}`);
+    res.json({ children: algoliaRes.data.children || [] });
+  } catch (err) {
+    console.error(`Error fetching raw comments for hnId ${hnId}:`, err.message);
+    res.status(502).json({ error: 'Failed to fetch comments' });
+  }
+});
 
 // GET /api/comments/:hnId/summary - Summarize Hacker News comments using Groq
 // authMiddleware isn't listed here, it's already applied to the whole /api prefix in index.js.
