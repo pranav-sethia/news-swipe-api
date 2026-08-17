@@ -1,3 +1,13 @@
+// pgvector returns embedding columns as either a JSON-array string or an
+// already-parsed array depending on the query shape - this normalizes both.
+const parseVector = (v) => typeof v === 'string' ? JSON.parse(v) : v;
+
+function normalize(vec) {
+  let magnitude = Math.sqrt(vec.reduce((sum, val) => sum + val * val, 0));
+  if (magnitude === 0) magnitude = 1;
+  return vec.map(val => val / magnitude);
+}
+
 function cosineSimilarity(vecA, vecB) {
   let dotProduct = 0;
   let normA = 0;
@@ -45,4 +55,4 @@ function randomizedInterleave(smartRows, dumbRows) {
   return result;
 }
 
-module.exports = { cosineSimilarity, randomizedInterleave };
+module.exports = { cosineSimilarity, randomizedInterleave, parseVector, normalize };

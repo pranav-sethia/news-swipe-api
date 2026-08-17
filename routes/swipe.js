@@ -4,19 +4,13 @@ const { apiActionLimiter } = require('../middleware/rateLimiters');
 
 const router = express.Router();
 
-const parseVector = (v) => typeof v === 'string' ? JSON.parse(v) : v;
-
-function alphaFor(swipeCount) {
-  if (swipeCount <= 10) return 0.5;
-  if (swipeCount > 50) return 0.05;
-  return 0.2;
-}
-
-function normalize(vec) {
-  let magnitude = Math.sqrt(vec.reduce((sum, val) => sum + val * val, 0));
-  if (magnitude === 0) magnitude = 1;
-  return vec.map(val => val / magnitude);
-}
+// This route is now pure log-writing - it just records what happened. All
+// taste modeling (long-term core, recent-phase responsiveness, category
+// affinity) is computed fresh from this log at read time in feed.js, using
+// two time-decay half-lives rather than any incrementally-maintained
+// EMA/session state. That's what makes an unlike (below) trivially correct
+// with no replay/reconstruction step: there's nothing cached to keep in
+// sync with the log, because nothing is cached at all.
 
 // POST /api/swipe
 router.post('/api/swipe', apiActionLimiter, async (req, res) => {
@@ -30,65 +24,10 @@ router.post('/api/swipe', apiActionLimiter, async (req, res) => {
       INSERT INTO user_swipes (user_id, article_id, liked)
       VALUES ($1, $2, $3)
       ON CONFLICT (user_id, article_id) DO UPDATE SET liked = $3, swipe_time = NOW()
-      RETURNING *, (xmax = 0) AS is_inserted
+      RETURNING *
     `;
     const { rows } = await pool.query(query, [userId, articleId, liked]);
-    const isInserted = rows[0].is_inserted;
     console.log(`Swipe saved: User ${userId} ${liked === null ? 'skipped neutrally' : (liked ? 'liked' : 'disliked')} Article ${articleId}`);
-
-    // If neutral skip or it was a duplicate swipe, do not alter the taste vector.
-    if (liked === null || !isInserted) {
-      return res.status(201).json(rows[0]);
-    }
-
-    // Update the EMA taste_vector
-    const currentData = await pool.query(`
-      SELECT u.taste_vector, a.embedding,
-             (SELECT COUNT(*) FROM user_swipes WHERE user_id = $1) as total_swipes
-      FROM users u
-      JOIN articles a ON a.id = $2
-      WHERE u.id = $1
-    `, [userId, articleId]);
-
-    if (currentData.rows.length > 0) {
-      const { taste_vector, embedding, total_swipes } = currentData.rows[0];
-
-      // Safety check: skip taste_vector update if article lacks embedding
-      if (!embedding) {
-        console.log(`Skipping taste vector update: Article ${articleId} lacks embedding.`);
-        return res.status(201).json(rows[0]);
-      }
-
-      const articleVec = parseVector(embedding);
-      let newVectorStr;
-
-      if (!taste_vector) {
-        if (liked) {
-          // Initialize taste profile
-          newVectorStr = `[${articleVec.join(',')}]`;
-        } else {
-          // First swipe is negative, can't shift an empty vector.
-          return res.status(201).json(rows[0]);
-        }
-      } else {
-        const userVec = parseVector(taste_vector);
-        const alpha = alphaFor(parseInt(total_swipes, 10));
-
-        let newVec;
-        if (liked) {
-          newVec = userVec.map((val, i) => (val * (1 - alpha)) + (articleVec[i] * alpha));
-        } else {
-          // Negative swipe: Shift away from article gently to not banish topics forever
-          const negativeAlpha = alpha * 0.15;
-          newVec = userVec.map((val, i) => val - (articleVec[i] * negativeAlpha));
-        }
-        newVectorStr = `[${normalize(newVec).join(',')}]`;
-      }
-
-      await pool.query(`UPDATE users SET taste_vector = $1 WHERE id = $2`, [newVectorStr, userId]);
-      console.log(`Updated EMA taste vector for User ${userId}`);
-    }
-
     res.status(201).json(rows[0]);
   } catch (err) {
     if (err.code === '23503') {
@@ -106,62 +45,7 @@ router.delete('/api/swipe/:articleId', apiActionLimiter, async (req, res) => {
   const { articleId } = req.params;
   try {
     await pool.query('DELETE FROM user_swipes WHERE user_id = $1 AND article_id = $2', [userId, articleId]);
-
-    // Recalculate taste vector from remaining likes AND dislikes to perfectly reconstruct the ML vector
-    const allSwipes = await pool.query(`
-      SELECT * FROM (
-        SELECT a.embedding, us.liked, us.swipe_time
-        FROM user_swipes us
-        JOIN articles a ON us.article_id = a.id
-        WHERE us.user_id = $1 AND us.liked IS NOT NULL AND a.embedding IS NOT NULL
-        ORDER BY us.swipe_time DESC
-        LIMIT 100
-      ) sub
-      ORDER BY sub.swipe_time ASC
-    `, [userId]);
-
-    if (allSwipes.rows.length === 0) {
-      await pool.query('UPDATE users SET taste_vector = NULL WHERE id = $1', [userId]);
-    } else {
-      let newVec = null;
-      let swipeCount = 0;
-
-      for (let i = 0; i < allSwipes.rows.length; i++) {
-        const row = allSwipes.rows[i];
-        const articleVec = parseVector(row.embedding);
-        const liked = row.liked;
-
-        if (newVec === null) {
-          if (liked) {
-            newVec = articleVec;
-            swipeCount++;
-          }
-          // If first swipe is negative, we can't initialize the vector, so we skip
-          continue;
-        }
-
-        swipeCount++;
-        const alpha = alphaFor(swipeCount);
-
-        if (liked) {
-          newVec = newVec.map((val, idx) => (val * (1 - alpha)) + (articleVec[idx] * alpha));
-        } else {
-          const negativeAlpha = alpha * 0.15;
-          newVec = newVec.map((val, idx) => val - (articleVec[idx] * negativeAlpha));
-        }
-        newVec = normalize(newVec);
-      }
-
-      if (newVec === null) {
-         // This happens if all remaining swipes are dislikes and we never got a first like.
-         await pool.query('UPDATE users SET taste_vector = NULL WHERE id = $1', [userId]);
-      } else {
-         const newVectorStr = `[${newVec.join(',')}]`;
-         await pool.query('UPDATE users SET taste_vector = $1 WHERE id = $2', [newVectorStr, userId]);
-      }
-    }
-
-    console.log(`Swipe deleted and vector perfectly rebuilt: User ${userId} un-liked Article ${articleId}`);
+    console.log(`Swipe deleted: User ${userId} un-liked Article ${articleId}`);
     res.status(200).json({ message: 'Swipe removed.' });
   } catch (err) {
     console.error('Error deleting swipe:', err);
@@ -169,14 +53,16 @@ router.delete('/api/swipe/:articleId', apiActionLimiter, async (req, res) => {
   }
 });
 
-// POST /api/reset
+// POST /api/reset - clears swipe history only. The onboarding-seeded
+// taste_vector (see routes/onboarding.js) deliberately isn't touched here:
+// it reflects the categories the user explicitly chose, not anything
+// derived from swipes, so a "reset my taste profile" action forgets learned
+// behavior without also discarding a stated preference.
 router.post('/api/reset', apiActionLimiter, async (req, res) => {
   const userId = req.user.id;
   try {
     await pool.query('DELETE FROM user_swipes WHERE user_id = $1', [userId]);
-    // Reset their average embedding vector too
-    await pool.query('UPDATE users SET taste_vector = NULL WHERE id = $1', [userId]);
-    console.log(`Swipes and vector reset for User ${userId}`);
+    console.log(`Swipes reset for User ${userId}`);
     res.status(200).json({ message: 'Swipes reset successfully' });
   } catch (err) {
     console.error('Error resetting swipes:', err);

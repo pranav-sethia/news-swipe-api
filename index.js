@@ -80,6 +80,15 @@ const startServer = async () => {
     await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_hash TEXT;');
     await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires TIMESTAMPTZ;');
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider TEXT NOT NULL DEFAULT 'password';");
+    // An incrementally-maintained session vector + streak-counter mechanism
+    // was tried and abandoned in favor of computing everything fresh from
+    // user_swipes at read time (see routes/feed.js) - two time-decay
+    // half-lives applied to the raw log, rather than separate cached state
+    // that could drift from it. Dropping the now-unused columns.
+    await client.query('ALTER TABLE users DROP COLUMN IF EXISTS session_vector;');
+    await client.query('ALTER TABLE users DROP COLUMN IF EXISTS session_vector_updated_at;');
+    await client.query('ALTER TABLE users DROP COLUMN IF EXISTS session_streak;');
+    await client.query('ALTER TABLE users DROP COLUMN IF EXISTS taste_surprise_streak;');
     await client.query('CREATE INDEX IF NOT EXISTS articles_embedding_idx ON articles USING hnsw (embedding vector_cosine_ops);');
     console.log(`✅ Schema updated with pgvector support and HNSW index.`);
 
