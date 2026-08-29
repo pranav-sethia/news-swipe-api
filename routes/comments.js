@@ -105,7 +105,11 @@ RULES:
     }
 
     const groqRes = await axios.post('https://api.groq.com/openai/v1/chat/completions', {
-      model: 'llama-3.1-8b-instant',
+      // llama-3.1-8b-instant was fully removed from Groq (see ingest.js for
+      // the full story) - openai/gpt-oss-20b + reasoning_effort: 'low' is
+      // the tested replacement, ~1,050 tokens for a realistic thread here.
+      model: 'openai/gpt-oss-20b',
+      reasoning_effort: 'low',
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: "Comment Thread:\n" + extractedText.substring(0, 6000) }

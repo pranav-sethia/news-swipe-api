@@ -1,154 +1,497 @@
 const express = require('express');
 const pool = require('../db');
-const { cosineSimilarity, randomizedInterleave, parseVector, normalize } = require('../utils/matching');
+const { cosineSimilarity, parseVector, normalize, computeConfidentlyDislikedSet, assembleBatch } = require('../utils/matching');
 const { apiActionLimiter } = require('../middleware/rateLimiters');
 
 const router = express.Router();
 
-const CANDIDATE_FETCH = 40;         // core-vector candidate pool size
-const RECENT_CANDIDATE_FETCH = 20;  // extra pool pulled in when the recent-phase vector carries real weight
-const SMART_FETCH = 12;             // all labelled as MATCH
-const DUMB_FETCH = 3;               // ~20% serendipity, random discovery
-const POPULAR_FETCH = 2;            // taste-independent - the biggest HN stories, so a strong match vector never fully buries them
-const SWIPE_HISTORY_LIMIT = 300;    // generous cap on how far back to look - at this product's realistic ~20-100-swipe lifetime, this is never actually hit
+// The fixed 9 category labels this whole pipeline reasons about (see
+// ingest.js's ALLOWED_CATEGORIES - kept in sync manually, there being no
+// shared config module between the ingestion script and the API yet).
+const ALL_CATEGORIES = [
+  'Software Engineering', 'Hardware & Systems', 'Artificial Intelligence',
+  'Startups & VC', 'Cybersecurity', 'Business & Finance',
+  'Science & Space', 'Design & UI/UX', 'Other',
+];
 
-// One taste model, two speeds, computed fresh from the raw swipe log on every
-// request - no incrementally-maintained vector/streak state anywhere. A
-// user's "core" identity and their current few-day "phase" aren't different
-// KINDS of signal needing different mechanisms - they're the same measurement
-// (how much have they liked things like this, weighted by how recently) taken
-// at two different half-lives. A half-life in the 48-72h band is simultaneously:
-// barely decayed after an hour (full within-session responsiveness), still
-// substantial after 3-4 days (a real phase is still felt while it's
-// happening), and faded to near-nothing after 1-2 weeks with no reinforcement
-// (a phase that ends actually ends) - one continuous curve covers "this
-// session" and "this week's phase" together, with nothing to reset or gate.
-const CORE_HALF_LIFE_HOURS = 60 * 24;  // 60 days - stable baseline across a realistic whole lifetime on this app
-const RECENT_HALF_LIFE_HOURS = 60;     // 2.5 days - same-session AND multi-day-phase, together
-const DISLIKE_DAMPENING = 0.15;        // shift away from disliked things gently, don't banish a topic forever
-// How much decayed "recent evidence mass" it takes for the recent-phase
-// vector to start counting for about half the blend - reuses the exact same
-// n/(n+K) shape as TASTE_CONFIDENCE_M below, just applied to decayed mass
-// instead of a raw swipe count, so a couple of recent likes already produce a
-// real, felt pull with no hard streak gate standing in the way.
+// --- Candidate-pool sizes (retrieval), unchanged from the prior design ---
+const CANDIDATE_FETCH = 40;
+const RECENT_CANDIDATE_FETCH = 20;
+const POPULAR_POOL_FETCH = 15;
+const DISCOVERY_POOL_FETCH = 20;
+const STRATIFIED_FLOOR_PER_CATEGORY = 2;
+
+// --- Delivery: a fixed total batch, ratio-scaled by confidence ---
+const BATCH_SIZE = 17; // matches the original, already-validated 12/3/2 total
+
+// --- Swipe history ---
+const SWIPE_HISTORY_LIMIT = 1000; // raised from 300 - a flat count risked truncating still-relevant history for an unusually heavy short-window user
+
+// --- The two-half-life taste vector, unchanged ---
+const CORE_HALF_LIFE_HOURS = 60 * 24;   // 60 days - deliberately slower than any realistic session or product tenure
+const RECENT_HALF_LIFE_HOURS = 60;      // 2.5 days - within-session responsive, faded within 1-2 weeks
+const DISLIKE_DAMPENING = 0.15;         // dislikes only ever feed the recent channel (see accumulation loop) - "a user shouldn't regret a dislike"
 const RECENT_MASS_PIVOT = 3;
 
-// Cold-start confidence ramp (IMDb-style Bayesian weighting: weight =
-// n/(n+m)). Every user is scored by the same formula - how much the
-// swipe-derived similarity term counts grows smoothly from ~0 to ~1 as real
-// swipes accumulate, with no threshold anywhere for a feed to visibly "flip."
-const TASTE_CONFIDENCE_M = 8;
+// --- The confidence dial: like-count based, not total-swipe-based ---
+// Composition-ramp speed only - NOT tied to badge timing, which is an
+// independent, directly-specified hard rule below.
+const TASTE_CONFIDENCE_M = 6;
 
-// HN score as a small, log-scaled tie-breaker. Constant normalization (rather
-// than the max score in the current candidate batch) keeps the contribution
-// stable across requests instead of shifting with whatever happens to be in
-// the pool that call.
-function scoreBonus(score) {
-  return (Math.log1p(score || 0) / Math.log1p(1000)) * 0.05;
+// --- Badges: a literal, hard gate, specified directly by product decision ---
+const LIKES_NEEDED_FOR_MATCHES = 3;
+
+// --- Skip mechanic ---
+const SKIP_HALF_LIFE_HOURS = 4;
+const SKIP_DAMPENING = -0.08; // deliberately ~half of DISLIKE_DAMPENING - a skip is a genuinely weaker signal than a dislike
+const SKIP_COOLDOWN_TRIGGER = 3;   // skips within the trailing window to trigger a mute
+const SKIP_COOLDOWN_WINDOW = 10;   // trailing served-cards window checked for the trigger
+const SKIP_COOLDOWN_CARDS = 25;    // mute duration in cards
+const SKIP_COOLDOWN_HOURS = 6;     // mute duration in hours - whichever threshold is reached first releases it
+
+// --- Disliked-category threshold, unified across both exclusion mechanisms ---
+// Cross-validated against DISLIKE_DAMPENING: a single fresh dislike
+// contributes catRecent ~= -0.15, so crossing -0.3 requires ~2 dislikes'
+// worth of decayed weight - one dislike alone can never trigger this.
+const CATEGORY_DISLIKE_FLOOR_THRESHOLD = 0.3;
+
+// --- Popularity weight, confidence-scaled ---
+const POPULARITY_WEIGHT_FLOOR = 0.05;       // at likeWeight=1 - never zero, a big story shouldn't vanish even for a power user
+const POPULARITY_WEIGHT_COLD_BONUS = 0.10;  // ceiling = 0.15 at likeWeight=0
+
+// --- Recency penalty ---
+const SMART_DISCOVERY_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+const SMART_DISCOVERY_RECENCY_PENALTY = 0.15;
+const POPULAR_RECENCY_HALF_LIFE_HOURS = 144; // ~6 days - HN's own news cycle makes a 90-day window meaningless for "trending"
+const POPULAR_RECENCY_PENALTY_CEILING = 0.15;
+
+// --- Composition shares ---
+const SHARE_BASE = 0.15;
+const SHARE_SWING = 0.15; // popularShare/discoveryShare = SHARE_BASE + SHARE_SWING*(1-likeWeight)
+
+// --- Diversity mechanisms ---
+const COMPOSITION_WINDOW = 15;
+const RUN_LENGTH_CAP = 3;
+const PORTFOLIO_CAP_MIN = 0.35;
+const PORTFOLIO_CAP_MAX = 0.80;
+const NEAR_TIE_MARGIN = 0.05;
+
+function popularityRaw(score) {
+  return Math.log1p(score || 0) / Math.log1p(1000);
 }
-
-// Score contribution from a user's category affinity, blended the same way
-// (core vs. recent-phase) as the embedding similarity below. Bounded to
-// roughly the same magnitude as the recency penalty, so no one signal
-// dominates.
-function categoryBonusFrom(affinity) {
-  if (!affinity) return 0;
-  return Math.sign(affinity) * Math.min(Math.abs(affinity), 5) * 0.01;
+function popularityWeight(likeWeight) {
+  return POPULARITY_WEIGHT_FLOOR + POPULARITY_WEIGHT_COLD_BONUS * (1 - likeWeight);
+}
+function categoryAffinity(category, catBlend, catSkip) {
+  if (!category) return 0;
+  const combined = (catBlend.get(category) || 0) + (catSkip.get(category) || 0);
+  if (!combined) return 0;
+  return Math.sign(combined) * Math.min(Math.abs(combined), 5) * 0.01;
+}
+function smartOrDiscoveryRecencyPenalty(publishedAt, nowMs) {
+  const ageMs = nowMs - new Date(publishedAt).getTime();
+  const ageRatio = Math.max(0, Math.min(1, ageMs / SMART_DISCOVERY_MAX_AGE_MS));
+  return ageRatio * SMART_DISCOVERY_RECENCY_PENALTY;
+}
+function popularRecencyPenalty(publishedAt, nowMs) {
+  const hoursAgo = (nowMs - new Date(publishedAt).getTime()) / (60 * 60 * 1000);
+  const decay = Math.pow(0.5, Math.max(0, hoursAgo) / POPULAR_RECENCY_HALF_LIFE_HOURS);
+  return (1 - decay) * POPULAR_RECENCY_PENALTY_CEILING;
+}
+function blendRetrievalVector(likeWeight, coreVector, onboardingVector) {
+  if (!coreVector && !onboardingVector) return null;
+  if (!coreVector) return onboardingVector;
+  if (!onboardingVector) return coreVector;
+  const dim = coreVector.length;
+  const blended = new Array(dim);
+  for (let i = 0; i < dim; i++) blended[i] = likeWeight * coreVector[i] + (1 - likeWeight) * onboardingVector[i];
+  return normalize(blended);
 }
 
 // GET /api/feed
 router.get('/api/feed', apiActionLimiter, async (req, res) => {
   const userId = req.user.id;
+  const excludeIds = (req.query.excludeIds ? String(req.query.excludeIds).split(',') : [])
+    .map(Number).filter(n => Number.isFinite(n));
 
   try {
-    // Update user activity to track inactive accounts
-    await pool.query('UPDATE users SET last_active = NOW() WHERE id = $1', [userId]).catch(err => console.error('Failed to update last_active:', err));
+    pool.query('UPDATE users SET last_active = NOW() WHERE id = $1', [userId]).catch(err => console.error('Failed to update last_active:', err));
 
-    const userResult = await pool.query('SELECT taste_vector FROM users WHERE id = $1', [userId]);
+    // These three are independent - fire together rather than paying three
+    // sequential round-trips. (An earlier version of this handler wrapped
+    // the whole request in a transaction with a per-user advisory lock, to
+    // guard against a rare, low-consequence race between near-simultaneous
+    // requests for the same user - measured live, that cost 2.7-4.8s per
+    // request by fully serializing ~9 round-trips onto one connection with
+    // zero parallelism, for a self-correcting edge case. Not worth it;
+    // reverted to plain pool.query with real parallelism instead.)
+    const [userResult, excludeCategoriesResult, swipeResult] = await Promise.all([
+      pool.query('SELECT taste_vector FROM users WHERE id = $1', [userId]),
+      excludeIds.length
+        ? pool.query('SELECT category FROM articles WHERE id = ANY($1::int[])', [excludeIds])
+        : Promise.resolve({ rows: [] }),
+      pool.query(`
+        SELECT a.embedding, a.category, us.liked,
+               EXTRACT(EPOCH FROM (NOW() - us.swipe_time)) / 3600.0 AS hours_ago
+        FROM user_swipes us
+        JOIN articles a ON a.id = us.article_id
+        WHERE us.user_id = $1 AND a.embedding IS NOT NULL
+        ORDER BY us.swipe_time DESC
+        LIMIT ${SWIPE_HISTORY_LIMIT}
+      `, [userId]),
+    ]);
     const onboardingVector = userResult.rows[0]?.taste_vector ? parseVector(userResult.rows[0].taste_vector) : null;
-
+    // Categories of the client's currently-kept, not-yet-swiped on-screen
+    // cards - served but invisible to the swipe log. Needed so the
+    // near-duplicate filter, portfolio cap, and run-length cap aren't blind
+    // to what the user is about to see next.
+    const excludeCategories = excludeCategoriesResult.rows.map(r => r.category).filter(Boolean);
     // The single source of truth for all taste modeling: every real swipe
-    // (like/dislike), how long ago it happened, its article's embedding and
-    // category. Everything below - the core vector, the recent-phase vector,
-    // category affinity, and the confidence ramp - is derived from these rows
-    // alone, recomputed fresh every request.
-    const swipeRows = (await pool.query(`
-      SELECT a.embedding, a.category, us.liked,
-             EXTRACT(EPOCH FROM (NOW() - us.swipe_time)) / 3600.0 AS hours_ago
-      FROM user_swipes us
-      JOIN articles a ON a.id = us.article_id
-      WHERE us.user_id = $1 AND us.liked IS NOT NULL AND a.embedding IS NOT NULL
-      ORDER BY us.swipe_time DESC
-      LIMIT ${SWIPE_HISTORY_LIMIT}
-    `, [userId])).rows;
-
-    const totalRealSwipes = swipeRows.length;
-    const tasteWeight = totalRealSwipes / (totalRealSwipes + TASTE_CONFIDENCE_M);
+    // (like/dislike/skip), how long ago it happened, its article's
+    // embedding and category. Recomputed fresh every request - no
+    // incrementally-maintained state anywhere.
+    const swipeRows = swipeResult.rows;
 
     const dim = onboardingVector ? onboardingVector.length : (swipeRows[0] ? parseVector(swipeRows[0].embedding).length : 384);
     const sumCore = new Array(dim).fill(0);
     const sumRecent = new Array(dim).fill(0);
     let recentMass = 0;
-    const catCore = new Map();   // category -> decayed net affinity, core half-life
-    const catRecent = new Map(); // category -> decayed net affinity, recent half-life
+    let likeCount = 0;
+    const catCore = new Map();
+    const catRecent = new Map();
+    const catSkip = new Map();
+    const catLikeCount = new Map();
+    const trailingCategories = []; // DESC by recency - index 0 is the most recent real swipe (like/dislike/skip)
 
     swipeRows.forEach(row => {
-      const vec = parseVector(row.embedding);
       const hoursAgo = parseFloat(row.hours_ago);
-      const wCore = Math.pow(0.5, hoursAgo / CORE_HALF_LIFE_HOURS);
-      const wRecent = Math.pow(0.5, hoursAgo / RECENT_HALF_LIFE_HOURS);
-      const sign = row.liked ? 1 : -DISLIKE_DAMPENING;
+      const category = row.category;
 
-      for (let i = 0; i < dim; i++) {
-        sumCore[i] += sign * wCore * vec[i];
-        sumRecent[i] += sign * wRecent * vec[i];
+      if (row.liked === true) {
+        const vec = parseVector(row.embedding);
+        const wCore = Math.pow(0.5, hoursAgo / CORE_HALF_LIFE_HOURS);
+        const wRecent = Math.pow(0.5, hoursAgo / RECENT_HALF_LIFE_HOURS);
+        for (let i = 0; i < dim; i++) {
+          sumCore[i] += wCore * vec[i];
+          sumRecent[i] += wRecent * vec[i];
+        }
+        recentMass += wRecent;
+        likeCount += 1;
+        if (category) {
+          catCore.set(category, (catCore.get(category) || 0) + wCore);
+          catRecent.set(category, (catRecent.get(category) || 0) + wRecent);
+          catLikeCount.set(category, (catLikeCount.get(category) || 0) + 1);
+        }
+      } else if (row.liked === false) {
+        // Dislikes only ever feed the fast (recent) channel, never the
+        // 60-day core one - "a user shouldn't regret a dislike." A stale
+        // dislike has zero pull on the long-term vector, ever.
+        const vec = parseVector(row.embedding);
+        const wRecent = Math.pow(0.5, hoursAgo / RECENT_HALF_LIFE_HOURS);
+        for (let i = 0; i < dim; i++) sumRecent[i] += -DISLIKE_DAMPENING * wRecent * vec[i];
+        recentMass += wRecent;
+        if (category) catRecent.set(category, (catRecent.get(category) || 0) - DISLIKE_DAMPENING * wRecent);
+      } else {
+        // Skip: never touches the embedding-level vector at all - only a
+        // short-lived, category-only nudge.
+        if (category) {
+          const wSkip = Math.pow(0.5, hoursAgo / SKIP_HALF_LIFE_HOURS);
+          catSkip.set(category, (catSkip.get(category) || 0) + SKIP_DAMPENING * wSkip);
+        }
       }
-      recentMass += wRecent;
-
-      if (row.category) {
-        catCore.set(row.category, (catCore.get(row.category) || 0) + sign * wCore);
-        catRecent.set(row.category, (catRecent.get(row.category) || 0) + sign * wRecent);
-      }
+      if (category) trailingCategories.push({ category, hoursAgo, liked: row.liked });
     });
 
-    // A near-zero magnitude means no meaningful signal yet (e.g. only
-    // dislikes so far, or no swipes at all) - treat as absent rather than
-    // normalizing noise into a meaningless direction.
     const coreMagnitude = Math.sqrt(sumCore.reduce((s, v) => s + v * v, 0));
     const recentMagnitude = Math.sqrt(sumRecent.reduce((s, v) => s + v * v, 0));
     const coreVector = coreMagnitude > 1e-6 ? normalize(sumCore) : null;
     const recentVector = recentMagnitude > 1e-6 ? normalize(sumRecent) : null;
 
-    // How much the recent-phase vector counts, relative to the core one -
-    // asymptotic (never fully overrides core identity), driven by decayed
-    // evidence mass rather than a discrete streak, so it grows the moment
-    // real recent signal exists instead of waiting for a hard gate to clear.
     const recentWeight = recentMass / (recentMass + RECENT_MASS_PIVOT);
 
     const catBlend = new Map();
-    const allCategories = new Set([...catCore.keys(), ...catRecent.keys()]);
-    allCategories.forEach(cat => {
-      const blended = (1 - recentWeight) * (catCore.get(cat) || 0) + recentWeight * (catRecent.get(cat) || 0);
-      catBlend.set(cat, blended);
+    new Set([...catCore.keys(), ...catRecent.keys()]).forEach(cat => {
+      catBlend.set(cat, (1 - recentWeight) * (catCore.get(cat) || 0) + recentWeight * (catRecent.get(cat) || 0));
     });
-    const dislikedCategories = [...catBlend.entries()].filter(([, v]) => v < 0).map(([cat]) => cat);
 
-    // Retrieval vector: whichever best represents established taste. Every
-    // user has a real onboardingVector from the moment they finish onboarding
-    // (see routes/onboarding.js), so coreVector is almost always what's used
-    // here; the fallback below only matters for an account that skipped
-    // onboarding AND hasn't swiped yet - and even then tasteWeight is ~0, so
-    // scoring already contributes nothing from similarity regardless of
-    // which branch supplied the candidates.
-    const retrievalVector = coreVector || onboardingVector;
+    const likeWeight = likeCount / (likeCount + TASTE_CONFIDENCE_M);
+    function categoryLikeWeight(cat) {
+      const n = catLikeCount.get(cat) || 0;
+      return n / (n + TASTE_CONFIDENCE_M);
+    }
 
-    let smartRows;
-    if (retrievalVector) {
-      smartRows = (await pool.query(`
+    // Confidently-disliked categories - one shared, magnitude-threshold
+    // concept, used for both discovery/popular exclusion and the smart-slot
+    // portfolio cap (via portfolioCapShareFor returning 0 for these).
+    const D = computeConfidentlyDislikedSet(catBlend, CATEGORY_DISLIKE_FLOOR_THRESHOLD);
+
+    // Skip-cooldown: 3+ skips on the same category within the trailing
+    // window mutes it from the smart slot. Recomputed fresh from the log
+    // every request (no persisted trigger timestamp) - this naturally,
+    // self-limitingly ages out as more swipes of any kind push the
+    // triggering skips out of the trailing window, approximating "25 cards
+    // or 6 hours, whichever first" without needing separate stored state.
+    function isCategoryOnSkipCooldown(category) {
+      // The trailing window itself is 10 cards, well under the 25-card mute
+      // duration, so the "cards" release condition is automatically
+      // satisfied whenever the trigger still holds - only the "6 hours"
+      // condition needs an explicit check. Once enough new swipes (of any
+      // kind) push the triggering skips out of this trailing-10 window, the
+      // mute self-releases with no persisted timer needed.
+      const win = trailingCategories.slice(0, SKIP_COOLDOWN_WINDOW);
+      const skipsInWindow = win.filter(r => r.liked === null && r.category === category);
+      if (skipsInWindow.length < SKIP_COOLDOWN_TRIGGER) return false;
+      // Anchor the time-based release to the oldest of the actually-
+      // triggering skips, not the oldest entry of any kind in the window - an
+      // older like/dislike of the same category sharing this trailing
+      // window (very plausible: someone with a real, established preference
+      // for a category who skips it 3x in a row today) must not falsely
+      // expire an otherwise-fresh mute just because that unrelated older
+      // swipe happens to be more than 6 hours old.
+      const triggeringSkips = skipsInWindow.slice(0, SKIP_COOLDOWN_TRIGGER); // most-recent-first
+      const oldestTriggeringSkip = triggeringSkips[triggeringSkips.length - 1];
+      return oldestTriggeringSkip.hoursAgo < SKIP_COOLDOWN_HOURS;
+    }
+
+    const retrievalVector = blendRetrievalVector(likeWeight, coreVector, onboardingVector);
+
+    // --- Retrieval ---
+    // The primary smart query, stratified floor, popular pool, and
+    // discovery pool are all independent of each other's row results (the
+    // discovery query no longer excludes popular's ids - assembleBatch's
+    // shared `usedIds` set already prevents any cross-pool duplicate
+    // selection, so that exclusion doesn't need to be a query-level
+    // dependency) - fire all four together rather than paying four
+    // sequential round-trips.
+    const eligibleForFloor = ALL_CATEGORIES.filter(cat => !D.has(cat) && !isCategoryOnSkipCooldown(cat));
+
+    const smartPrimaryPromise = retrievalVector
+      ? pool.query(`
+          SELECT a.id, a.title, a.description, a.article_url, a.image_url, a.source_name, a.published_at,
+                 a.score, a.num_comments, a.hn_id, a.embedding, a.read_time_minutes, a.category,
+                 (1 - (a.embedding <=> $1))::float AS similarity_raw,
+                 reason.title AS match_reason
+          FROM articles a
+          LEFT JOIN LATERAL (
+            SELECT liked_article.title
+            FROM user_swipes us
+            JOIN articles liked_article ON us.article_id = liked_article.id
+            WHERE us.user_id = $2 AND us.liked = true AND liked_article.embedding IS NOT NULL
+            ORDER BY liked_article.embedding <=> a.embedding
+            LIMIT 1
+          ) reason ON true
+          WHERE a.embedding IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM user_swipes us2 WHERE us2.user_id = $2 AND us2.article_id = a.id)
+            AND NOT (a.id = ANY($4::int[]))
+            AND a.published_at::timestamp > NOW() - INTERVAL '90 days'
+          ORDER BY a.embedding <=> $1
+          LIMIT $3
+        `, [`[${retrievalVector.join(',')}]`, userId, CANDIDATE_FETCH, excludeIds])
+      : pool.query(`
+          SELECT id, title, description, article_url, image_url, source_name, published_at,
+                 score, num_comments, hn_id, embedding, read_time_minutes, category,
+                 NULL::float AS similarity_raw, NULL::text AS match_reason
+          FROM articles
+          WHERE embedding IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM user_swipes us2 WHERE us2.user_id = $1 AND us2.article_id = articles.id)
+            AND NOT (id = ANY($3::int[]))
+          ORDER BY published_at DESC
+          LIMIT $2
+        `, [userId, CANDIDATE_FETCH, excludeIds]);
+
+    const stratifiedPromise = eligibleForFloor.length
+      ? pool.query(`
+          SELECT * FROM (
+            SELECT id, title, description, article_url, image_url, source_name, published_at,
+                   score, num_comments, hn_id, embedding, read_time_minutes, category,
+                   NULL::float AS similarity_raw, NULL::text AS match_reason,
+                   ROW_NUMBER() OVER (PARTITION BY category ORDER BY published_at DESC) AS rn
+            FROM articles
+            WHERE embedding IS NOT NULL
+              AND category = ANY($1::text[])
+              AND NOT EXISTS (SELECT 1 FROM user_swipes us2 WHERE us2.user_id = $2 AND us2.article_id = articles.id)
+              AND NOT (id = ANY($3::int[]))
+          ) ranked
+          WHERE rn <= ${STRATIFIED_FLOOR_PER_CATEGORY}
+        `, [eligibleForFloor, userId, excludeIds])
+      : Promise.resolve({ rows: [] });
+
+    const popularPromise = pool.query(`
+      SELECT id, title, description, article_url, image_url, source_name, published_at,
+             score, num_comments, hn_id, embedding, read_time_minutes, category,
+             NULL::float AS similarity_raw, NULL::text AS match_reason
+      FROM articles
+      WHERE NOT EXISTS (SELECT 1 FROM user_swipes us2 WHERE us2.user_id = $1 AND us2.article_id = articles.id)
+        AND NOT (id = ANY($2::int[]))
+        AND embedding IS NOT NULL
+        AND published_at::timestamp > NOW() - INTERVAL '7 days'
+        AND (category IS NULL OR NOT (category = ANY($3::text[])))
+      ORDER BY score DESC, num_comments DESC
+      LIMIT ${POPULAR_POOL_FETCH}
+    `, [userId, excludeIds, [...D]]);
+
+    const discoveryPromise = pool.query(`
+      SELECT id, title, description, article_url, image_url, source_name, published_at,
+             score, num_comments, hn_id, embedding, read_time_minutes, category,
+             NULL::float AS similarity_raw, NULL::text AS match_reason
+      FROM articles
+      WHERE NOT EXISTS (SELECT 1 FROM user_swipes us2 WHERE us2.user_id = $1 AND us2.article_id = articles.id)
+        AND NOT (id = ANY($2::int[]))
+        AND embedding IS NOT NULL
+        AND published_at::timestamp > NOW() - INTERVAL '7 days'
+        AND (category IS NULL OR NOT (category = ANY($3::text[])))
+      ORDER BY RANDOM()
+      LIMIT ${DISCOVERY_POOL_FETCH}
+    `, [userId, excludeIds, [...D]]);
+
+    const [smartPrimaryResult, stratifiedResult, popularResult, discoveryResult] = await Promise.all([
+      smartPrimaryPromise, stratifiedPromise, popularPromise, discoveryPromise,
+    ]);
+
+    let smartCandidates = smartPrimaryResult.rows;
+
+    // Supplemental ANN pool near the recent-phase vector - kept sequential
+    // after the primary query since it needs the primary's ids to exclude
+    // (a genuine dependency, unlike the four pools above).
+    if (retrievalVector && recentVector && recentWeight > 0.05) {
+      const existingIds = smartCandidates.map(r => r.id);
+      const { rows: recentRows } = await pool.query(`
         SELECT a.id, a.title, a.description, a.article_url, a.image_url, a.source_name, a.published_at,
                a.score, a.num_comments, a.hn_id, a.embedding, a.read_time_minutes, a.category,
-               (1 - (a.embedding <=> $1))::float AS similarity_raw,
-               reason.title AS match_reason
+               (1 - (a.embedding <=> $1))::float AS recent_similarity_raw
+        FROM articles a
+        WHERE a.embedding IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM user_swipes us2 WHERE us2.user_id = $2 AND us2.article_id = a.id)
+          AND NOT (a.id = ANY($5::int[]))
+          AND a.published_at::timestamp > NOW() - INTERVAL '90 days'
+          AND NOT (a.id = ANY($3::int[]))
+        ORDER BY a.embedding <=> $1
+        LIMIT $4
+      `, [`[${recentVector.join(',')}]`, userId, existingIds, RECENT_CANDIDATE_FETCH, excludeIds]);
+      smartCandidates = smartCandidates.concat(recentRows);
+    }
+
+    // Stratified category floor: for every category not on cooldown or in
+    // D, pull at least a couple of recent candidates directly - this is
+    // what makes the portfolio/run-length caps below enforceable at all.
+    const seenSmartIds = new Set(smartCandidates.map(r => r.id));
+    stratifiedResult.rows.forEach(r => { if (!seenSmartIds.has(r.id)) { smartCandidates.push(r); seenSmartIds.add(r.id); } });
+
+    const popularCandidates = popularResult.rows;
+    const discoveryCandidates = discoveryResult.rows;
+
+    // --- Scoring ---
+    const nowMs = Date.now();
+    function scoreRows(rows, recencyFn) {
+      rows.forEach(r => {
+        r.parsed_embedding = typeof r.embedding === 'string' ? JSON.parse(r.embedding) : r.embedding;
+        const simCore = r.similarity_raw != null
+          ? parseFloat(r.similarity_raw)
+          : (retrievalVector ? cosineSimilarity(r.parsed_embedding, retrievalVector) : 0);
+        const simRecent = recentVector
+          ? (r.recent_similarity_raw != null ? parseFloat(r.recent_similarity_raw) : cosineSimilarity(r.parsed_embedding, recentVector))
+          : simCore;
+        const simBlended = (1 - recentWeight) * simCore + recentWeight * simRecent;
+        r.similarity_raw = simBlended; // downstream badge logic reads this field unchanged
+        r.final_score = (likeWeight * simBlended)
+          + categoryAffinity(r.category, catBlend, catSkip)
+          + (popularityRaw(r.score) * popularityWeight(likeWeight))
+          - recencyFn(r.published_at, nowMs);
+      });
+      return rows;
+    }
+    scoreRows(smartCandidates, smartOrDiscoveryRecencyPenalty);
+    scoreRows(discoveryCandidates, smartOrDiscoveryRecencyPenalty);
+    scoreRows(popularCandidates, popularRecencyPenalty);
+
+    // De-dupe within each pool
+    function dedupe(rows) {
+      const seen = new Set();
+      return rows.filter(r => (seen.has(r.id) ? false : (seen.add(r.id), true)));
+    }
+    const candidatesByType = {
+      smart: dedupe(smartCandidates).sort((a, b) => b.final_score - a.final_score),
+      popular: dedupe(popularCandidates).sort((a, b) => b.final_score - a.final_score),
+      discovery: dedupe(discoveryCandidates).sort((a, b) => b.final_score - a.final_score),
+    };
+
+    // --- Composition ---
+    const popularShare = SHARE_BASE + SHARE_SWING * (1 - likeWeight);
+    const discoveryShare = SHARE_BASE + SHARE_SWING * (1 - likeWeight);
+    const smartShare = 1 - popularShare - discoveryShare;
+
+    function portfolioCapShareFor(category) {
+      if (!category || D.has(category)) return 0;
+      return PORTFOLIO_CAP_MIN + (PORTFOLIO_CAP_MAX - PORTFOLIO_CAP_MIN) * categoryLikeWeight(category);
+    }
+
+    // Real cross-fetch context for the run-length/portfolio-cap window.
+    // replaceStale now refetches on nearly every swipe, keeping only the
+    // KEEP_TOP=2 on-screen cards - seeding assembleBatch's window with just
+    // those 2 loses visibility into what was actually shown moments ago in
+    // prior fetches. RUN_LENGTH_CAP=3 > KEEP_TOP=2 means a run could reach 4
+    // before the cap ever sees it, and the portfolio cap (window=15) would
+    // effectively never see the true trailing history at all, since a fresh
+    // fetch happens almost every card. Fold in the real swipe log's trailing
+    // categories (oldest-first, skips included - they're shown/served cards
+    // too) ahead of the on-screen cards to restore true continuity.
+    const priorCategorySequence = trailingCategories
+      .slice(0, COMPOSITION_WINDOW)
+      .map(r => r.category)
+      .reverse()
+      .concat(excludeCategories);
+
+    const assembled = assembleBatch({
+      candidatesByType,
+      targetShares: { smart: smartShare, popular: popularShare, discovery: discoveryShare },
+      batchSize: BATCH_SIZE,
+      initialCategorySequence: priorCategorySequence,
+      portfolioCapShareFn: portfolioCapShareFor,
+      runLengthCap: RUN_LENGTH_CAP,
+      compositionWindow: COMPOSITION_WINDOW,
+      nearTieMargin: NEAR_TIE_MARGIN,
+      isOnCooldown: isCategoryOnSkipCooldown,
+      dislikedSet: D,
+    });
+
+    // Reverse to match the existing "weakest at index 0 (shown last),
+    // strongest at end (shown first)" frontend contract - assembleBatch
+    // builds in shown-soonest-first order.
+    assembled.reverse();
+
+    // --- Badges and labeling ---
+    const badgeEligible = likeCount >= LIKES_NEEDED_FOR_MATCHES;
+    assembled.forEach(r => {
+      if (r.__type === 'smart') {
+        if (badgeEligible) {
+          const sim = parseFloat(r.similarity_raw);
+          let norm = (sim - 0.1) / 0.7;
+          norm = Math.max(0, Math.min(1, norm));
+          r.match_pct = Math.round(50 + norm * 49);
+        } else {
+          r.match_pct = null;
+          r.taste_progress = Math.min(likeCount, LIKES_NEEDED_FOR_MATCHES);
+          r.swipes_until_matches = Math.max(0, LIKES_NEEDED_FOR_MATCHES - likeCount);
+        }
+      } else if (r.__type === 'popular') {
+        r.match_pct = null;
+        r.discovery_type = 'popular';
+      } else {
+        r.match_pct = null;
+        r.discovery_type = 'random';
+      }
+    });
+
+    // Backfill match_reason for badge-eligible cards that didn't come
+    // through the primary ANN query (stratified-floor and recent-vector
+    // candidates never had the LATERAL "most similar liked article" lookup
+    // applied) - "computed after selection, only for cards receiving a real
+    // match_pct," regardless of which retrieval pool supplied them. Cheap:
+    // scoped to the small handful of ids that actually need it.
+    const needsReason = assembled.filter(r => r.match_pct && !r.match_reason).map(r => r.id);
+    if (needsReason.length) {
+      const { rows: reasonRows } = await pool.query(`
+        SELECT a.id, reason.title AS match_reason
         FROM articles a
         LEFT JOIN LATERAL (
           SELECT liked_article.title
@@ -158,179 +501,22 @@ router.get('/api/feed', apiActionLimiter, async (req, res) => {
           ORDER BY liked_article.embedding <=> a.embedding
           LIMIT 1
         ) reason ON true
-        WHERE a.embedding IS NOT NULL
-          AND NOT EXISTS (SELECT 1 FROM user_swipes us2 WHERE us2.user_id = $2 AND us2.article_id = a.id)
-          AND a.published_at::timestamp > NOW() - INTERVAL '90 days'
-        ORDER BY a.embedding <=> $1
-        LIMIT $3
-      `, [`[${retrievalVector.join(',')}]`, userId, CANDIDATE_FETCH])).rows;
-
-      // When the recent-phase vector currently carries real weight, also pull
-      // candidates near IT - a genuine pivot can be cosine-far from the core
-      // vector and would otherwise never enter the pool for a score bonus to
-      // rescue afterward.
-      if (recentVector && recentWeight > 0.05) {
-        const existingIds = smartRows.map(r => r.id);
-        const recentRows = (await pool.query(`
-          SELECT a.id, a.title, a.description, a.article_url, a.image_url, a.source_name, a.published_at,
-                 a.score, a.num_comments, a.hn_id, a.embedding, a.read_time_minutes, a.category,
-                 (1 - (a.embedding <=> $1))::float AS recent_similarity_raw
-          FROM articles a
-          WHERE a.embedding IS NOT NULL
-            AND NOT EXISTS (SELECT 1 FROM user_swipes us2 WHERE us2.user_id = $2 AND us2.article_id = a.id)
-            AND a.published_at::timestamp > NOW() - INTERVAL '90 days'
-            AND NOT (a.id = ANY($3::int[]))
-          ORDER BY a.embedding <=> $1
-          LIMIT $4
-        `, [`[${recentVector.join(',')}]`, userId, existingIds, RECENT_CANDIDATE_FETCH])).rows;
-        smartRows = smartRows.concat(recentRows);
-      }
-    } else {
-      smartRows = (await pool.query(`
-        SELECT id, title, description, article_url, image_url, source_name, published_at,
-               score, num_comments, hn_id, embedding, read_time_minutes, category,
-               NULL::float AS similarity_raw, NULL::text AS match_reason
-        FROM articles
-        WHERE embedding IS NOT NULL
-          AND NOT EXISTS (SELECT 1 FROM user_swipes us2 WHERE us2.user_id = $1 AND us2.article_id = articles.id)
-        ORDER BY published_at DESC
-        LIMIT $2
-      `, [userId, CANDIDATE_FETCH])).rows;
+        WHERE a.id = ANY($1::int[])
+      `, [needsReason, userId]);
+      const reasonById = new Map(reasonRows.map(r => [r.id, r.match_reason]));
+      assembled.forEach(r => { if (reasonById.has(r.id)) r.match_reason = reasonById.get(r.id); });
     }
 
-    // Parse embeddings once; compute whichever similarity value wasn't
-    // already supplied by SQL, then blend the two similarity SCORES - not
-    // the vectors themselves. Averaging two vectors that point in genuinely
-    // different directions (exactly the case being designed for - a real
-    // topic pivot) can produce something dissimilar to both.
-    const nowMs = Date.now();
-    const MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
-
-    smartRows.forEach(r => {
-      r.parsed_embedding = typeof r.embedding === 'string' ? JSON.parse(r.embedding) : r.embedding;
-
-      const simCore = r.similarity_raw != null
-        ? parseFloat(r.similarity_raw)
-        : (retrievalVector ? cosineSimilarity(r.parsed_embedding, retrievalVector) : 0);
-      const simRecent = recentVector
-        ? (r.recent_similarity_raw != null
-            ? parseFloat(r.recent_similarity_raw)
-            : cosineSimilarity(r.parsed_embedding, recentVector))
-        : simCore; // no-op when there's no recent-phase signal yet
-
-      const simBlended = (1 - recentWeight) * simCore + recentWeight * simRecent;
-      r.similarity_raw = simBlended; // downstream badge/sort logic reads this field unchanged
-
-      const ageMs = nowMs - new Date(r.published_at).getTime();
-      const ageRatio = Math.max(0, Math.min(1, ageMs / MAX_AGE_MS));
-      // Recency penalty: older articles lose up to 0.15 of similarity score
-      r.final_score = (tasteWeight * simBlended) - (ageRatio * 0.15)
-        + categoryBonusFrom(catBlend.get(r.category))
-        + scoreBonus(r.score);
+    assembled.forEach(r => {
+      delete r.embedding;
+      delete r.parsed_embedding;
+      delete r.recent_similarity_raw;
+      delete r.final_score;
+      delete r.__type;
+      if (!(r.match_pct)) delete r.match_reason;
     });
 
-    // De-dupe (the recent-phase fetch above already excludes ids already in
-    // the core set, but a candidate could otherwise appear via both if that
-    // filter were ever loosened - cheap safety net either way).
-    const seenIds = new Set();
-    smartRows = smartRows.filter(r => (seenIds.has(r.id) ? false : (seenIds.add(r.id), true)));
-
-    // Sort by final_score descending
-    smartRows.sort((a, b) => b.final_score - a.final_score);
-
-    // Apply MMR (Maximal Marginal Relevance) to select top diverse articles
-    const selectedSmart = [];
-    for (const candidate of smartRows) {
-      if (selectedSmart.length >= SMART_FETCH) break;
-
-      let maxSimilarityToSelected = -1;
-      for (const selected of selectedSmart) {
-        const sim = cosineSimilarity(candidate.parsed_embedding, selected.parsed_embedding);
-        if (sim > maxSimilarityToSelected) maxSimilarityToSelected = sim;
-      }
-
-      // Diversity penalty: if it's too similar (> 0.90) to something already selected, skip it
-      if (maxSimilarityToSelected > 0.90) {
-         continue;
-      }
-      selectedSmart.push(candidate);
-    }
-
-    // If we filtered out too many, backfill with whatever we had to ensure we hit SMART_FETCH
-    if (selectedSmart.length < SMART_FETCH) {
-      for (const candidate of smartRows) {
-        if (selectedSmart.length >= SMART_FETCH) break;
-        if (!selectedSmart.find(s => s.id === candidate.id)) {
-          selectedSmart.push(candidate);
-        }
-      }
-    }
-
-    smartRows = selectedSmart;
-
-    // Label ALL smart articles with relative match % (50-99%). This is
-    // always a RELATIVE ranking display (how this card compares to the rest
-    // of the candidate pool), never a calibrated confidence score, so it
-    // isn't tapered down for a low-data new account - a card here is,
-    // relatively speaking, genuinely one of this pool's best matches
-    // regardless of how much history informed the pool.
-    if (smartRows.length > 0) {
-      smartRows.forEach(r => {
-        const sim = parseFloat(r.similarity_raw);
-        // Absolute scaling: Map raw cosine similarity (~0.1 to 0.8) to a percentage (50% to 99%)
-        let norm = (sim - 0.1) / 0.7;
-        norm = Math.max(0, Math.min(1, norm)); // Clamp between 0.0 and 1.0
-        r.match_pct = Math.round(50 + norm * 49); // 50% to 99%
-        delete r.embedding; // Cleanup before sending to client
-        delete r.parsed_embedding;
-        delete r.recent_similarity_raw;
-      });
-    }
-
-    // Sort ascending: weakest at index 0 (shown last), strongest at end (shown first).
-    smartRows.sort((a, b) => parseFloat(a.similarity_raw) - parseFloat(b.similarity_raw));
-
-    // Serendipity: a few recent random articles the user hasn't seen, excluding
-    // categories they've already told us (via net dislikes) they don't want.
-    // Random discovery shouldn't mean "show them what they just disliked".
-    const smartIds = smartRows.map(a => a.id);
-    const dumbRows = (await pool.query(`
-      SELECT id, title, description, article_url, image_url, source_name, published_at,
-             score, num_comments, hn_id, read_time_minutes, NULL::float AS similarity_raw
-      FROM articles
-      WHERE NOT EXISTS (SELECT 1 FROM user_swipes us2 WHERE us2.user_id = $1 AND us2.article_id = articles.id)
-        AND NOT (id = ANY($2::int[]))
-        AND embedding IS NOT NULL
-        AND published_at::timestamp > NOW() - INTERVAL '7 days'
-        AND (category IS NULL OR NOT (category = ANY($3::text[])))
-      ORDER BY RANDOM()
-      LIMIT ${DUMB_FETCH}
-    `, [userId, smartIds, dislikedCategories])).rows;
-    dumbRows.forEach(r => { r.discovery_type = 'random'; });
-
-    // Popular: the biggest HN stories by real engagement, regardless of taste
-    // match - so a strong match vector never fully buries a story everyone's
-    // talking about just because it isn't this user's usual topic.
-    const excludedIds = [...smartIds, ...dumbRows.map(r => r.id)];
-    const popularRows = (await pool.query(`
-      SELECT id, title, description, article_url, image_url, source_name, published_at,
-             score, num_comments, hn_id, read_time_minutes, NULL::float AS similarity_raw
-      FROM articles
-      WHERE NOT EXISTS (SELECT 1 FROM user_swipes us2 WHERE us2.user_id = $1 AND us2.article_id = articles.id)
-        AND NOT (id = ANY($2::int[]))
-        AND embedding IS NOT NULL
-        AND published_at::timestamp > NOW() - INTERVAL '7 days'
-        AND (category IS NULL OR NOT (category = ANY($3::text[])))
-      ORDER BY score DESC, num_comments DESC
-      LIMIT ${POPULAR_FETCH}
-    `, [userId, excludedIds, dislikedCategories])).rows;
-    popularRows.forEach(r => { r.discovery_type = 'popular'; });
-
-    // Probabilistic interleave, no fixed pattern, randomized positions with constraints.
-    const finalFeed = randomizedInterleave(smartRows, [...dumbRows, ...popularRows]);
-
-    res.json(finalFeed);
-
+    res.json(assembled);
   } catch (err) {
     console.error('Error fetching feed:', err);
     res.status(500).json({ error: 'Internal server error' });

@@ -114,8 +114,22 @@ Rules for bullets: They MUST be fragments and MUST NOT exceed 60 characters.`;
           'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
           'Content-Type': 'application/json' 
         },
-        body: JSON.stringify({ 
-          model: 'llama-3.1-8b-instant', 
+        body: JSON.stringify({
+          // llama-3.1-8b-instant was fully removed from Groq's lineup (not
+          // renamed - confirmed live against /v1/models) at some point
+          // after this was last touched, which silently broke ingestion:
+          // every categorization call failed with "model does not exist,"
+          // and this loop's per-article try/catch treated that as a normal
+          // skip rather than a hard failure, so the GitHub Actions run kept
+          // reporting green while inserting zero new articles for ~12 days.
+          // openai/gpt-oss-20b is a reasoning model - reasoning_effort:
+          // 'low' cuts a trivial call's reasoning tokens from ~71 to ~12
+          // (confirmed live) while still producing correct structured
+          // output; a real categorization call costs ~1,550 tokens, close
+          // to the old model's ~1,900 estimate, against a live-confirmed
+          // 8,000 tokens/min budget (up from 6,000).
+          model: 'openai/gpt-oss-20b',
+          reasoning_effort: 'low',
           messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: promptText + "\\n\\nTitle: " + title + "\\n\\nArticle Text:\\n" + text.substring(0, 4000) }
