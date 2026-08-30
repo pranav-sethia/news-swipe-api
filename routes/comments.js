@@ -126,12 +126,34 @@ RULES:
     const responseText = groqRes.data.choices[0].message.content.trim();
     const parsed = JSON.parse(responseText);
 
+    // Live testing (10 real threads) caught a real ~20% failure mode: the
+    // model sometimes fails to close the "takeaways" array before starting
+    // "criticisms", spilling stray fragments into it - e.g. [...3 real
+    // takeaways, "Criticisms", ":", []] or a criticism buried in a trailing
+    // nested array. Rather than trying to cleverly recover buried content
+    // from an already-malformed structure (fragile), sanitize to the
+    // intended shape: only real, non-trivial strings, capped at 3 - this
+    // fully absorbs both observed malformations, since the garbage always
+    // appeared after the legitimate items.
+    // Also strips an occasional leaked schema-label prefix the model
+    // sometimes echoes into the text itself (e.g. "Criticism 1: ...",
+    // "Point 2: ..."), caught live in this same sample.
+    const sanitizeStringArray = (arr) => (Array.isArray(arr) ? arr : [])
+      .filter(item => typeof item === 'string' && item.trim().length > 0)
+      .map(item => item.trim().replace(/^(criticism|point|takeaway)\s*\d*\s*:\s*/i, ''))
+      .slice(0, 3);
+    const sanitized = {
+      consensus: typeof parsed.consensus === 'string' ? parsed.consensus.trim() : '',
+      takeaways: sanitizeStringArray(parsed.takeaways),
+      criticisms: sanitizeStringArray(parsed.criticisms),
+    };
+
     await pool.query(
       `UPDATE articles SET comments_summary = $1, summary_generated_at = NOW() WHERE hn_id = $2`,
-      [parsed, hnId]
+      [sanitized, hnId]
     );
 
-    res.json({ status: 'success', summary: parsed });
+    res.json({ status: 'success', summary: sanitized });
   } catch (err) {
     if (err.response) {
       if (err.response.status === 429) {

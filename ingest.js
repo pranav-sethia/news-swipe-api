@@ -197,10 +197,23 @@ Rules for bullets: They MUST be fragments and MUST NOT exceed 60 characters.`;
 
     const responseText = data.choices[0].message.content.trim();
     const parsed = JSON.parse(responseText);
-    
+
+    // The model is instructed to keep bullets under 60 chars ("a strict UI
+    // width limit") but a 45-article real sample caught it violating that by
+    // 2 chars once (~1% of bullets) - cheap to enforce as a safety net rather
+    // than trust the model to always self-comply. Truncate at the nearest
+    // word boundary rather than mid-word, since a hard character cut can
+    // land inside a word.
+    function truncateAtWordBoundary(str, maxLen) {
+      if (str.length <= maxLen) return str;
+      const cut = str.slice(0, maxLen);
+      const lastSpace = cut.lastIndexOf(' ');
+      return (lastSpace > maxLen * 0.6 ? cut.slice(0, lastSpace) : cut).trim();
+    }
+
     let validBullets = Array.isArray(parsed.bullets) ? parsed.bullets.slice(0, 3) : [];
     const summaryLines = validBullets.map(b => {
-      let text = b.replace(/^- /, '').trim();
+      let text = truncateAtWordBoundary(b.replace(/^- /, '').trim(), 60);
       return `- ${text}`;
     }).join('\n');
 
@@ -212,8 +225,13 @@ Rules for bullets: They MUST be fragments and MUST NOT exceed 60 characters.`;
     const finalCategory = parsed.category === "Web3 & Crypto"
       ? "Business & Finance"
       : (allowedCategories.includes(parsed.category) ? parsed.category : "Other");
-    
-    let validTags = Array.isArray(parsed.tags) ? parsed.tags.slice(0, 3).map(t => String(t).substring(0, 20)) : [];
+
+    // Same real-sample check caught tags mid-word truncated at a bare 20-char
+    // cut ("government surveilla", "spectral power distr") - not currently
+    // rendered anywhere in the frontend, but a real, visible defect the
+    // moment they are. Same word-boundary fix, slightly more headroom (30
+    // chars) since tags run a bit longer than the bullets.
+    let validTags = Array.isArray(parsed.tags) ? parsed.tags.slice(0, 3).map(t => truncateAtWordBoundary(String(t), 30)) : [];
     
     return {
       summary: summaryLines,
