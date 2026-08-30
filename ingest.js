@@ -44,6 +44,25 @@ async function isImageGoodQuality(imageUrl) {
   }
 }
 
+// Groq's rate limits are tracked per-MODEL, not pooled across an account's
+// models (confirmed live: burning down openai/gpt-oss-20b's own budget left
+// openai/gpt-oss-120b's and qwen/qwen3.8-27b's remaining-tokens counters
+// completely untouched). That's what makes the model split below possible -
+// ingestion and routes/comments.js now draw from two fully independent free
+// budgets instead of racing each other on one.
+//
+// Parses Groq's rate-limit duration strings ("607ms", "1.042s", "17m16.8s")
+// into milliseconds, for adaptive pacing below.
+function parseGroqDurationMs(str) {
+  if (!str) return null;
+  const match = str.match(/^(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?(?:(\d+(?:\.\d+)?)ms)?$/);
+  if (!match) return null;
+  const minutes = parseFloat(match[1] || 0);
+  const seconds = parseFloat(match[2] || 0);
+  const ms = parseFloat(match[3] || 0);
+  return minutes * 60000 + seconds * 1000 + ms;
+}
+
 let extractor;
 async function getExtractor() {
   if (!extractor) {
@@ -122,14 +141,18 @@ Rules for bullets: They MUST be fragments and MUST NOT exceed 60 characters.`;
           // and this loop's per-article try/catch treated that as a normal
           // skip rather than a hard failure, so the GitHub Actions run kept
           // reporting green while inserting zero new articles for ~12 days.
-          // openai/gpt-oss-20b is a reasoning model - reasoning_effort:
-          // 'low' cuts a trivial call's reasoning tokens from ~71 to ~12
-          // (confirmed live) while still producing correct structured
-          // output; a real categorization call costs ~1,550 tokens, close
-          // to the old model's ~1,900 estimate, against a live-confirmed
-          // 8,000 tokens/min budget (up from 6,000).
-          model: 'openai/gpt-oss-20b',
-          reasoning_effort: 'low',
+          //
+          // qwen/qwen3.8-27b, not openai/gpt-oss-20b (used by
+          // routes/comments.js): since Groq's rate limits are per-model, this
+          // gives ingestion its own free budget - 8,000 tokens/min (same as
+          // gpt-oss-20b) but 2,000,000 tokens/DAY vs gpt-oss-20b's 200,000 -
+          // confirmed live via /docs/rate-limits, matched exactly by live
+          // response headers. Live-tested side by side against gpt-oss-20b
+          // on this exact prompt (a clean case and a genuinely ambiguous
+          // AI-vs-Business&Finance one): identical category decisions,
+          // comparably specific bullets, comparable real token cost (~1,700-
+          // 1,930/call). Not a reasoning model - no reasoning_effort param.
+          model: 'qwen/qwen3.8-27b',
           messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: promptText + "\\n\\nTitle: " + title + "\\n\\nArticle Text:\\n" + text.substring(0, 4000) }
@@ -139,7 +162,7 @@ Rules for bullets: They MUST be fragments and MUST NOT exceed 60 characters.`;
         })
       });
       data = await res.json();
-      
+
       if (res.status === 429) {
         const waitMsg = data.error?.message || "";
         const match = waitMsg.match(/try again in (\\d+\\.?\\d*)s/);
@@ -149,17 +172,29 @@ Rules for bullets: They MUST be fragments and MUST NOT exceed 60 characters.`;
         retries--;
         continue;
       }
-      
+
       if (!res.ok) {
         throw new Error(data.error?.message || 'Failed to fetch from Groq');
       }
       break;
     }
-    
+
     if (!res || !res.ok) {
       throw new Error("Exhausted retries for Groq API");
     }
-    
+
+    // Adaptive pacing signal for the caller (processArticles): rather than a
+    // flat guessed delay between articles (the old 5s guess was ~2.7x too
+    // fast for the real ~1,930 avg tokens/call against an 8,000/min budget -
+    // live-confirmed by actually hitting 429 five times in one 17-article
+    // run), read Groq's own real-time remaining-tokens counter and only wait
+    // when actually close to empty, for exactly as long as Groq itself says
+    // the window needs to refill.
+    const rateLimitInfo = {
+      remainingTokens: parseInt(res.headers.get('x-ratelimit-remaining-tokens'), 10),
+      resetTokensMs: parseGroqDurationMs(res.headers.get('x-ratelimit-reset-tokens')),
+    };
+
     const responseText = data.choices[0].message.content.trim();
     const parsed = JSON.parse(responseText);
     
@@ -184,11 +219,19 @@ Rules for bullets: They MUST be fragments and MUST NOT exceed 60 characters.`;
       summary: summaryLines,
       category: finalCategory,
       tags: validTags,
-      bullets: parsed.bullets
+      bullets: parsed.bullets,
+      rateLimitInfo
     };
   } catch (error) {
+    // Distinguishable from the "not enough text" short-circuit above: this
+    // is a REAL Groq/API failure (network, exhausted retries, bad JSON,
+    // "model does not exist"), never a legitimate content-quality skip.
+    // processArticles uses this distinction to detect a systemic outage
+    // (e.g. a future silent model deprecation) instead of letting it hide
+    // behind the ordinary per-article skip path, as happened for ~12 days
+    // last time.
     console.error(`Error generating summary via Groq:`, error.message);
-    return null;
+    return { groqFailed: true };
   }
 }
 
@@ -322,14 +365,42 @@ async function refreshRecentEngagement() {
   console.log(`Refreshed engagement for ${updated}/${rows.length} recent articles.`);
 }
 
+// Comfortably above the observed max single-call cost (~2,310 tokens) so
+// pacing waits BEFORE actually running dry, not after; used to decide
+// whether to wait out the rest of Groq's real per-minute window between
+// articles, replacing the old flat 5s guess that turned out to be ~2.7x too
+// fast for the real ~1,930 avg tokens/call (live-confirmed: hit 429 five
+// times in one 17-article run).
+const SAFETY_MARGIN_TOKENS = 2600;
+const FALLBACK_DELAY_MS = 3000; // used only when a call didn't return real rate-limit headers to pace against
+
+function computeAdaptiveDelayMs(rateLimitInfo) {
+  if (!rateLimitInfo || !Number.isFinite(rateLimitInfo.remainingTokens) || !Number.isFinite(rateLimitInfo.resetTokensMs)) {
+    return FALLBACK_DELAY_MS;
+  }
+  if (rateLimitInfo.remainingTokens < SAFETY_MARGIN_TOKENS) {
+    return rateLimitInfo.resetTokensMs + 250; // small buffer past the exact reset instant
+  }
+  return 0; // still comfortably within budget - real per-call latency already spaces requests out
+}
+
 async function processArticles() {
+  // Counts a REAL Groq/API failure (never a legitimate "text too short to
+  // summarize" skip - see getSummary's { groqFailed: true } vs plain null).
+  // If nearly every real attempt this run fails, that's a systemic outage
+  // (e.g. a deprecated/renamed model) worth failing this GitHub Actions run
+  // loudly over, rather than letting it hide behind the ordinary per-article
+  // skip path for potentially another ~12 days like last time.
+  let groqAttempts = 0;
+  let groqFailures = 0;
+
   try {
     console.log("Starting ingestion process...");
 
     await refreshRecentEngagement().catch(error => console.error("Error refreshing recent engagement:", error.message));
 
     const articles = await scrapeHackerNews();
-  
+
   for (const article of articles) {
     try {
       const existsResult = await pool.query('SELECT id FROM articles WHERE hn_id = $1', [article.hn_id]);
@@ -346,15 +417,21 @@ async function processArticles() {
       let readTime = null;
       let imageUrl = null;
       let sourceName = null;
+      let rateLimitInfo = null;
 
       const extractedData = await extractArticleData(article.url);
       if (extractedData) {
         const result = await getSummary(extractedData.text, article.title);
-        if (result) {
+        if (result && result.groqFailed) {
+          groqAttempts++;
+          groqFailures++;
+        } else if (result) {
+          groqAttempts++;
           description = result.summary;
           category = result.category;
           tags = JSON.stringify(result.tags);
           readTime = extractedData.readTimeMinutes;
+          rateLimitInfo = result.rateLimitInfo;
         }
         imageUrl = extractedData.imageUrl || null;
         if (extractedData.sourceName) sourceName = extractedData.sourceName;
@@ -362,6 +439,7 @@ async function processArticles() {
 
       if (!description) {
         console.log(`⚠️ Skipped: Not enough text to summarize properly or LLM refused (${article.title})`);
+        await new Promise(r => setTimeout(r, computeAdaptiveDelayMs(rateLimitInfo)));
         continue;
       }
 
@@ -370,6 +448,7 @@ async function processArticles() {
 
       if (!embedding) {
         console.log(`⚠️ Skipped: Failed to generate vector embedding (${article.title})`);
+        await new Promise(r => setTimeout(r, computeAdaptiveDelayMs(rateLimitInfo)));
         continue;
       }
 
@@ -391,19 +470,22 @@ async function processArticles() {
           readTime
         ]
       );
-      
+
       console.log(`✅ Saved: ${article.title}`);
-      
-      // Safety delay to prevent Groq rate limit (especially when ingesting 15 articles rapidly)
-      await new Promise(r => setTimeout(r, 5000));
-      
+
+      await new Promise(r => setTimeout(r, computeAdaptiveDelayMs(rateLimitInfo)));
+
     } catch (error) {
       console.error(`❌ Error processing article ${article.hn_id}:`, error.message);
     }
   }
 
-
     console.log("Ingestion process complete.");
+
+    if (groqAttempts >= 3 && groqFailures / groqAttempts >= 0.8) {
+      console.error(`❌ CRITICAL: ${groqFailures}/${groqAttempts} Groq calls failed this run - this looks like a systemic outage (e.g. a deprecated/renamed model), not ordinary per-article skips. Failing this run loudly instead of reporting a silent success with near-zero real saves.`);
+      process.exitCode = 1;
+    }
   } finally {
     console.log("Closing DB connection...");
     await pool.end();

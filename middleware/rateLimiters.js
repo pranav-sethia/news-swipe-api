@@ -31,23 +31,31 @@ const summaryPerUserLimiter = rateLimit({
 // openai/gpt-oss-20b (+ reasoning_effort: 'low', a real, meaningful cost
 // lever for this reasoning-model family - cut a realistic call from ~198 to
 // ~1,050-1,550 tokens depending on prompt size vs. what an unconstrained
-// reasoning pass would cost). Re-confirmed live against this account's
-// actual x-ratelimit-limit-tokens header (this session): 8,000 tokens/min,
-// ACCOUNT-WIDE, not per-user or per-IP (see console.groq.com/docs/rate-limits) -
-// up from the old model's 6,000. Live-measured against the real
+// reasoning pass would cost).
+//
+// Groq's rate limits are tracked per-MODEL, not pooled account-wide across
+// every model (confirmed live: burning down one model's budget left two
+// other models' remaining-tokens counters completely untouched, contradicting
+// an earlier docs paraphrase that claimed a single shared pool). ingest.js
+// was moved to a different model (qwen/qwen3.8-27b, see ingest.js) for
+// exactly this reason - it now draws from its own independent 8,000
+// tokens/min, 2,000,000 tokens/day budget, so its periodic 2-hour bursts no
+// longer compete with this route's budget at all. This route's model
+// (openai/gpt-oss-20b) keeps its own 8,000 tokens/min, 200,000 tokens/day
+// budget, live-confirmed via /docs/rate-limits and matched exactly by live
+// response headers. Live-measured against the real
 // /api/comments/:hnId/summary route itself (not just an equivalent raw
 // prompt): real threads cost 1,300-1,800 total tokens depending on comment
 // volume, with reasoning_tokens consistently ~4 (confirms reasoning_effort:
 // 'low' is actually suppressing the reasoning overhead this model family
-// would otherwise burn); ingest.js's longer categorization prompt costs
-// ~1,550. ingest.js shares this same budget in bursts every 2 hours. Capping
-// fresh (cache-miss) summary generations at 2/min globally uses at most
-// ~3,600 of the 8,000 TPM (both calls at the high end) - still ample
-// headroom for ingest.js's periodic burst, kept at the same conservative
-// value rather than raised, since it was never the binding constraint. This
-// is in-memory and per-process, fine for a single instance; would need a
-// shared store (e.g. Redis) if this ever runs on more than one dyno.
-const GROQ_SUMMARY_MAX_PER_MIN = 2;
+// would otherwise burn). Capping fresh (cache-miss) summary generations at
+// 4/min globally uses at most ~7,200 of this model's own 8,000 TPM (worst
+// case, every call at the high end) - raised from the old 2/min now that
+// this budget is no longer shared with ingest.js's bursts, giving more
+// headroom for concurrent users at real launch scale. This is in-memory and
+// per-process, fine for a single instance; would need a shared store (e.g.
+// Redis) if this ever runs on more than one dyno.
+const GROQ_SUMMARY_MAX_PER_MIN = 4;
 const groqSummaryCallTimestamps = [];
 function reserveGroqSummarySlot() {
   const now = Date.now();
