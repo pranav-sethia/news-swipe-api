@@ -9,6 +9,16 @@ const { pipeline } = require('@xenova/transformers');
 
 const OG_FETCH_TIMEOUT_MS = 4000;
 const IMAGE_CHECK_TIMEOUT_MS = 5000;
+// Neither the primary categorization call nor the self-consistency vote calls
+// previously had any request timeout at all (unlike extractArticleData's
+// safeFetch, which already used a 4000ms AbortController) - a single hung
+// Groq response could stall the whole ingestion run indefinitely with zero
+// visible error. Found this live: a real batch test appeared to silently
+// stop making progress with no console output for 45+ minutes. 30s is
+// generous for a real response (observed real calls complete in under 1s)
+// but bounds the failure mode to "one retry-able error" instead of "hangs
+// forever."
+const GROQ_CALL_TIMEOUT_MS = 30000;
 const MIN_IMAGE_DIMENSION = 200;
 // Calibrated against a real near-black Twitter video-thumbnail placeholder
 // (mean ~3) vs. legitimate article images (mean 85-245) - comfortably below
@@ -82,6 +92,91 @@ async function getEmbedding(text) {
   }
 }
 
+const ALLOWED_CATEGORIES = ["Software Engineering", "Hardware & Systems", "Artificial Intelligence", "Startups & VC", "Cybersecurity", "Business & Finance", "Science & Space", "Design & UI/UX", "Other"];
+
+// Lightweight category-only vote for self-consistency checking - reuses the
+// same TAXONOMY/RULE-1 text as the primary call (kept in sync manually,
+// see getSummary) but skips bullets/tags/relevance_flag entirely, so it's not
+// meaningfully cheaper than the full call (input tokens - the article text -
+// dominate cost either way) but avoids paying for bullet/tag generation we'd
+// throw away. Uses a higher temperature than the primary call's 0 specifically
+// to get genuine sample diversity - voting with more temp=0 calls would just
+// repeat the same answer for no benefit (live-confirmed this session).
+async function voteCategory(text, title) {
+  const systemPrompt = `You are a precision taxonomy and classification engine for a technology news aggregator. Your task is to analyze the provided text and output a JSON object.`;
+  const promptText = `Classify the following text into exactly ONE of the following categories based on its primary theme:
+
+TAXONOMY:
+- Software Engineering: Programming languages, web/mobile development, databases, algorithms, DevOps, infrastructure, open-source projects, game development, and software architecture.
+- Hardware & Systems: Semiconductors, GPUs, networking, servers, operating systems, embedded systems, robotics, IoT, self-driving technology, and consumer electronics (e.g., Apple hardware).
+- Artificial Intelligence: LLMs, machine learning, neural networks, computer vision, data science, NLP, and AI agents. Reserved for articles primarily about the technology, research, or techniques themselves.
+- Startups & VC: Early-stage companies, venture capital, fundraising, incubators (like YC), entrepreneurship, founders, and product management.
+- Cybersecurity: Vulnerabilities, hacking, zero-days, infosec, privacy laws, encryption (non-crypto), malware, and network security.
+- Business & Finance: Corporate acquisitions (M&A), earnings reports, stock market, tech industry economics, Big Tech antitrust/lawsuits, layoffs, FCC/FTC tech regulations, enterprise pricing, and blockchain/cryptocurrency business or regulatory news.
+- Science & Space: Physics, biology, biotech, medicine, astronomy, aerospace (e.g., SpaceX), mathematics, climate tech, and energy.
+- Design & UI/UX: Typography, frontend aesthetics, user experience research, human-computer interaction (HCI), and web accessibility.
+- Other: Any topic that does not clearly and specifically match one of the categories above. This is the default for anything outside technology, science, or business: music, art, food, general or classical history, language and linguistics, personal essays, hobbies, internet culture, and similar. When in doubt between Other and a narrow specific category like Design & UI/UX, prefer Other unless the article is unambiguously and primarily about that specific category's subject matter.
+
+RULES:
+1. Determine the PRIMARY theme, not just mentioned keywords. If an article is fundamentally about a company's funding round, valuation, or other early-stage deal mechanics, classify it as Startups & VC, even when the company's product involves AI. If it is fundamentally about an acquisition, earnings, or other corporate/market news, classify it as Business & Finance, even when the company involved is an AI company. Reserve Artificial Intelligence for articles primarily about the technology, research, or techniques themselves, not company or deal news that happens to mention AI.
+2. You must provide your step-by-step reasoning BEFORE outputting the final category.`;
+  try {
+    const voteTimeout = new AbortController();
+    const voteTimeoutId = setTimeout(() => voteTimeout.abort(), GROQ_CALL_TIMEOUT_MS);
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      signal: voteTimeout.signal,
+      headers: { 'Authorization': `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'qwen/qwen3.8-27b',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: promptText + "\n\nTitle: " + title + "\n\nArticle Text:\n" + text.substring(0, 4000) }
+        ],
+        temperature: 0.35,
+        response_format: {
+          type: 'json_schema',
+          json_schema: {
+            name: 'category_vote',
+            strict: true,
+            schema: {
+              type: 'object',
+              properties: {
+                reasoning: { type: 'string' },
+                category: { type: 'string', enum: ALLOWED_CATEGORIES },
+              },
+              required: ['reasoning', 'category'],
+              additionalProperties: false,
+            },
+          },
+        },
+      }),
+    });
+    clearTimeout(voteTimeoutId);
+    const rateLimitInfo = {
+      remainingTokens: parseInt(res.headers.get('x-ratelimit-remaining-tokens'), 10),
+      resetTokensMs: parseGroqDurationMs(res.headers.get('x-ratelimit-reset-tokens')),
+    };
+    if (!res.ok) return { category: null, rateLimitInfo };
+    const data = await res.json();
+    const parsed = JSON.parse(data.choices[0].message.content.trim());
+    const category = ALLOWED_CATEGORIES.includes(parsed.category) ? parsed.category : null;
+    return { category, rateLimitInfo };
+  } catch {
+    return { category: null, rateLimitInfo: null };
+  }
+}
+
+// Conservative aggregation across the primary call + 2 vote calls' rate-limit
+// headers - takes whichever reading shows the LEAST remaining budget, so the
+// caller's adaptive pacing (computeAdaptiveDelayMs) accounts for all 3 calls'
+// real consumption, not just the primary call's (now-stale) snapshot.
+function mostDepleted(...infos) {
+  const valid = infos.filter(i => i && Number.isFinite(i.remainingTokens));
+  if (!valid.length) return infos.find(Boolean) || null;
+  return valid.reduce((min, i) => (i.remainingTokens < min.remainingTokens ? i : min));
+}
+
 async function getSummary(text, title) {
   // 200 chars (~30 words) let near-empty scrapes (cookie banners, stub pages) through;
   // 500 is closer to a real minimum paragraph of article content.
@@ -105,20 +200,17 @@ TAXONOMY:
 RULES:
 1. Determine the PRIMARY theme, not just mentioned keywords. If an article is fundamentally about a company's funding round, valuation, or other early-stage deal mechanics, classify it as Startups & VC, even when the company's product involves AI. If it is fundamentally about an acquisition, earnings, or other corporate/market news, classify it as Business & Finance, even when the company involved is an AI company. Reserve Artificial Intelligence for articles primarily about the technology, research, or techniques themselves, not company or deal news that happens to mention AI.
 2. You must provide your step-by-step reasoning BEFORE outputting the final category.
-3. Extract exactly 3 bullet points summarizing the article's core news value objectively. We have a strict UI width limit. Bullets MUST NOT exceed 60 characters in total length.
-4. To achieve this, write a draft, then aggressively condense it by removing articles (a, an, the) and using sentence fragments.
+3. Extract exactly 3 bullet points capturing the article's actual core idea, insight, or news value - what a reader would want to know even without clicking through. Each bullet must add real information beyond the title; never merely restate or lightly reword the title. Avoid pure jargon/spec dumps (a wall of acronyms/numbers with no sense of why they matter) - if a technical detail is central to the news value, briefly frame why it matters, not just what the number is. Avoid vague, generic phrasing that could describe many different articles - be as SPECIFIC to this exact article's actual content as possible. We have a strict UI width limit: bullets MUST NOT exceed 60 characters in total length.
+4. To achieve this, write a full grammatical draft sentence first, then condense it into a fragment by dropping ONLY the subject and articles (a, an, the). Never drop a verb, an infinitive marker ("to"), a preposition, or a conjunction that grammatically connects the words you keep - every bullet must still read as a single correct clause once you mentally restore the implied subject and dropped article. A bullet that is just a noun phrase or label with no verb at all (e.g. dropping the verb entirely instead of just the subject) is WRONG, not a valid fragment - it must still assert something happening or being true, not just name a topic. If the draft is still over 60 characters after that, shorten it further by cutting whole low-value words or phrases, never by deleting the connecting words that hold the remaining words together.
+   GOOD (specific, correct fragment): "Teaches others to spot bugs by simulating real users"
+   BAD (vague AND ungrammatical): "Teaches others spot bugs" / "New bug-finding approach shared"
+   GOOD (has a real verb/claim): "Raises funding through circular deals with major partners"
+   BAD (bare noun phrase, no verb - just a label): "Circular financing via partner investment deals"
 5. Extract 3 highly specific technical tags.
+6. Set relevance_flag to 'mismatch' ONLY if the Article Text is clearly about a different, unrelated topic than the Title (e.g. it looks like a rotating example/sample post embedded on a landing page, or unrelated boilerplate) - otherwise 'match', even if the text is merely brief or tangential. Still do your best to summarize whatever the text actually contains even if you set it to 'mismatch'.
+7. Write ONLY the bullet content itself. Never include citations, footnotes, bracketed annotations, source markers, or commentary about your own answer or reasoning process.
 
-JSON SCHEMA:
-{
-  "reasoning": "string (Explain step-by-step why the primary theme fits the chosen category)",
-  "category": "string (Must be exactly one category from the TAXONOMY list)",
-  "tags": ["string", "string", "string"],
-  "draft_bullets": ["string", "string", "string"],
-  "bullets": ["string (max 60 chars)", "string (max 60 chars)", "string (max 60 chars)"]
-}
-
-Rules for bullets: They MUST be fragments and MUST NOT exceed 60 characters.`;
+Rules for bullets: They MUST be grammatically correct sentence fragments containing a real verb (only the subject and articles may be omitted - a bare noun-phrase label with no verb at all is not a valid fragment), MUST capture real, specific content from the article (never a title restatement or generic filler), MUST NOT include citations or meta-commentary, and MUST NOT exceed 60 characters. Never drop a required verb, infinitive, preposition, or conjunction.`;
 
     if (!process.env.GROQ_API_KEY) {
       throw new Error("Missing GROQ_API_KEY environment variable. Cloud ingestion requires this key.");
@@ -127,11 +219,14 @@ Rules for bullets: They MUST be fragments and MUST NOT exceed 60 characters.`;
     let res, data;
     let retries = 3;
     while (retries > 0) {
+      const groqTimeout = new AbortController();
+      const groqTimeoutId = setTimeout(() => groqTimeout.abort(), GROQ_CALL_TIMEOUT_MS);
       res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
-        headers: { 
+        signal: groqTimeout.signal,
+        headers: {
           'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
-          'Content-Type': 'application/json' 
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify({
           // llama-3.1-8b-instant was fully removed from Groq's lineup (not
@@ -157,15 +252,67 @@ Rules for bullets: They MUST be fragments and MUST NOT exceed 60 characters.`;
             { role: 'system', content: systemPrompt },
             { role: 'user', content: promptText + "\\n\\nTitle: " + title + "\\n\\nArticle Text:\\n" + text.substring(0, 4000) }
           ],
-          temperature: 0.1,
-          response_format: { type: "json_object" }
+          // temperature 0, not 0.1 - live-tested against real, targeted
+          // boundary-case articles (genuinely confusable category pairs):
+          // temp=0 alone fully stabilized every case that showed any
+          // instability at 0.1, at zero added cost. Self-consistency voting
+          // below (voteCategory) catches the rarer residual case where even
+          // temp=0 could differ from the "true" better answer.
+          temperature: 0,
+          // strict:true constrained decoding, not just json_object mode - live-verified
+          // against Groq's real API (both this model and openai/gpt-oss-20b support it)
+          // that minItems/maxItems on arrays and enum on category are structurally
+          // guaranteed, not just requested. Deliberately NOT using maxLength on the
+          // bullet strings - live-tested and confirmed it performs a raw character
+          // cutoff mid-generation that splits words across array-element boundaries
+          // (e.g. "cataleptic" became "...cata" + "leptic..." across two elements) -
+          // worse than no constraint. The 60-char limit stays a prompt instruction,
+          // backed by truncateAtWordBoundary below.
+          response_format: {
+            type: 'json_schema',
+            json_schema: {
+              name: 'article_classification',
+              strict: true,
+              schema: {
+                type: 'object',
+                properties: {
+                  reasoning: { type: 'string' },
+                  category: {
+                    type: 'string',
+                    enum: [
+                      'Software Engineering', 'Hardware & Systems', 'Artificial Intelligence',
+                      'Startups & VC', 'Cybersecurity', 'Business & Finance',
+                      'Science & Space', 'Design & UI/UX', 'Other',
+                    ],
+                  },
+                  relevance_flag: {
+                    type: 'string',
+                    enum: ['match', 'mismatch'],
+                    description: "Does the Article Text actually describe the subject named in the Title? Set 'mismatch' ONLY if the text is clearly about a different, unrelated topic (e.g. it looks like a rotating example/sample post embedded on a landing page, or unrelated boilerplate) rather than the actual subject of the Title. If the text is merely brief, tangential, or uses the topic as one example among others, that still counts as 'match'.",
+                  },
+                  tags: { type: 'array', items: { type: 'string' }, minItems: 3, maxItems: 3 },
+                  draft_bullets: { type: 'array', items: { type: 'string' }, minItems: 3, maxItems: 3 },
+                  bullets: { type: 'array', items: { type: 'string' }, minItems: 3, maxItems: 3 },
+                },
+                required: ['reasoning', 'category', 'relevance_flag', 'tags', 'draft_bullets', 'bullets'],
+                additionalProperties: false,
+              },
+            },
+          },
         })
       });
+      clearTimeout(groqTimeoutId);
       data = await res.json();
 
       if (res.status === 429) {
         const waitMsg = data.error?.message || "";
-        const match = waitMsg.match(/try again in (\\d+\\.?\\d*)s/);
+        // Was double-escaped (\\d instead of \d) inside a regex LITERAL, where
+        // \\d matches a literal backslash+d, never a digit - silently never
+        // matched real Groq error text ("...try again in 8.223s"), always
+        // falling back to the flat 10s default below. Harmless in practice
+        // (a sensible fallback), but never actually used Groq's own suggested
+        // wait time as intended. Found while investigating an unrelated stall.
+        const match = waitMsg.match(/try again in (\d+\.?\d*)s/);
         const waitSeconds = match ? parseFloat(match[1]) : 10;
         console.log(`⏳ Groq Rate Limit Hit. Waiting ${waitSeconds.toFixed(1)} seconds...`);
         await new Promise(r => setTimeout(r, (waitSeconds + 0.5) * 1000));
@@ -217,14 +364,31 @@ Rules for bullets: They MUST be fragments and MUST NOT exceed 60 characters.`;
       return `- ${text}`;
     }).join('\n');
 
-    const allowedCategories = ["Software Engineering", "Hardware & Systems", "Artificial Intelligence", "Startups & VC", "Cybersecurity", "Business & Finance", "Science & Space", "Design & UI/UX", "Other"];
     // Web3 & Crypto was merged into Business & Finance (too small a category to
     // support a reliable ranking signal, see the taxonomy distribution check).
     // The model shouldn't output it anymore given the prompt above, but remap
     // defensively in case it does.
-    const finalCategory = parsed.category === "Web3 & Crypto"
+    const primaryCategory = parsed.category === "Web3 & Crypto"
       ? "Business & Finance"
-      : (allowedCategories.includes(parsed.category) ? parsed.category : "Other");
+      : (ALLOWED_CATEGORIES.includes(parsed.category) ? parsed.category : "Other");
+
+    // Self-consistency voting: 2 more lightweight category-only calls at a
+    // higher temperature (genuine sample diversity, unlike more temp=0 calls
+    // which would just repeat the same answer), majority vote against the
+    // primary. Catches the rarer residual sampling instability temp=0 alone
+    // doesn't - live-tested this session. On a 3-way split with no majority,
+    // fall back to the primary (temp=0) call's own category, the single most
+    // deterministic sample available.
+    const [voteResult1, voteResult2] = await Promise.all([voteCategory(text, title), voteCategory(text, title)]);
+    const votes = [primaryCategory, voteResult1.category, voteResult2.category].filter(Boolean);
+    const voteCounts = {};
+    votes.forEach(v => { voteCounts[v] = (voteCounts[v] || 0) + 1; });
+    const [topCategory, topCount] = Object.entries(voteCounts).sort((a, b) => b[1] - a[1])[0];
+    const finalCategory = topCount >= 2 ? topCategory : primaryCategory;
+    if (finalCategory !== primaryCategory || new Set(votes).size > 1) {
+      console.log(`ℹ️ Category vote non-unanimous for "${title}": primary=${primaryCategory}, votes=[${votes.join(', ')}], final=${finalCategory}`);
+    }
+    const combinedRateLimitInfo = mostDepleted(rateLimitInfo, voteResult1.rateLimitInfo, voteResult2.rateLimitInfo);
 
     // Same real-sample check caught tags mid-word truncated at a bare 20-char
     // cut ("government surveilla", "spectral power distr") - not currently
@@ -238,7 +402,8 @@ Rules for bullets: They MUST be fragments and MUST NOT exceed 60 characters.`;
       category: finalCategory,
       tags: validTags,
       bullets: parsed.bullets,
-      rateLimitInfo
+      relevanceFlag: parsed.relevance_flag,
+      rateLimitInfo: combinedRateLimitInfo
     };
   } catch (error) {
     // Distinguishable from the "not enough text" short-circuit above: this
@@ -436,6 +601,7 @@ async function processArticles() {
       let imageUrl = null;
       let sourceName = null;
       let rateLimitInfo = null;
+      let mismatchSkipped = false;
 
       const extractedData = await extractArticleData(article.url);
       if (extractedData) {
@@ -443,6 +609,18 @@ async function processArticles() {
         if (result && result.groqFailed) {
           groqAttempts++;
           groqFailures++;
+        } else if (result && result.relevanceFlag === 'mismatch') {
+          // Not a Groq/API failure - a real, structurally-valid response that
+          // self-reported its extracted text doesn't actually match the
+          // title (e.g. Readability grabbed a rotating "featured content"
+          // block off a thin marketing page instead of the real article).
+          // Don't save; this hn_id isn't inserted, so it's simply
+          // re-attempted on a future cron run for as long as it stays in
+          // HN's top-500 - not a permanent loss.
+          groqAttempts++;
+          rateLimitInfo = result.rateLimitInfo;
+          mismatchSkipped = true;
+          console.log(`⚠️ Skipped: possible content/title mismatch (${article.title}) - ${article.url}`);
         } else if (result) {
           groqAttempts++;
           description = result.summary;
@@ -456,7 +634,9 @@ async function processArticles() {
       }
 
       if (!description) {
-        console.log(`⚠️ Skipped: Not enough text to summarize properly or LLM refused (${article.title})`);
+        if (!mismatchSkipped) {
+          console.log(`⚠️ Skipped: Not enough text to summarize properly or LLM refused (${article.title})`);
+        }
         await new Promise(r => setTimeout(r, computeAdaptiveDelayMs(rateLimitInfo)));
         continue;
       }
@@ -510,4 +690,8 @@ async function processArticles() {
   }
 }
 
-processArticles();
+module.exports = { getSummary, getEmbedding, extractArticleData, computeAdaptiveDelayMs, parseGroqDurationMs };
+
+if (require.main === module) {
+  processArticles();
+}

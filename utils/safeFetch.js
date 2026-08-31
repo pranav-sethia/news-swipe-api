@@ -3,6 +3,14 @@ const net = require('net');
 
 const MAX_REDIRECTS = 5;
 const DEFAULT_MAX_BYTES = 10 * 1024 * 1024; // 10MB
+// dns.lookup has no built-in timeout and runs BEFORE the caller's own
+// AbortController/timeout ever applies (that only covers the fetch() call
+// below, not this check) - a slow/unresponsive DNS response for any
+// candidate URL could hang the whole ingestion pipeline indefinitely with
+// no visible error, completely bypassing callers' own timeouts. Found live:
+// a real batch run stalled silently for 15+ minutes with no error, twice,
+// on different candidate URLs, before this was traced to here.
+const DNS_LOOKUP_TIMEOUT_MS = 3000;
 
 // Blocks loopback, RFC1918, link-local (which includes the 169.254.169.254
 // cloud metadata endpoint), and IPv6 equivalents.
@@ -38,10 +46,15 @@ async function isSafeUrl(urlString) {
   try {
     const parsed = new URL(urlString);
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
-    const addresses = await dns.lookup(parsed.hostname, { all: true });
+    const addresses = await Promise.race([
+      dns.lookup(parsed.hostname, { all: true }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('DNS lookup timed out')), DNS_LOOKUP_TIMEOUT_MS)),
+    ]);
     if (addresses.length === 0) return false;
     return addresses.every(({ address }) => !isPrivateIp(address));
   } catch {
+    // Fails closed (same as any other lookup error) - a timeout is treated
+    // as "could not verify this URL is safe," not "assume it's fine."
     return false;
   }
 }

@@ -87,16 +87,10 @@ router.get('/api/comments/:hnId/summary', summaryPerUserLimiter, async (req, res
 
     const systemPrompt = `You are an expert summarizer. Analyze the provided Hacker News comment thread. Identify and completely ignore tangential, pedantic, or off-topic arguments. Focus your summary strictly on the core discussion regarding the main article.
 
-JSON SCHEMA:
-{
-  "consensus": "A 1-2 sentence overarching sentiment of the thread.",
-  "takeaways": ["Point 1", "Point 2", "Point 3"],
-  "criticisms": ["Criticism 1"]
-}
-
 RULES:
 1. If the community is overwhelmingly positive and there are no notable criticisms, return an empty array [] for criticisms.
-2. Be extremely concise. Keep takeaways to a single sentence each.`;
+2. Be extremely concise. Keep takeaways to a single sentence each.
+3. Write ONLY the summary content itself. Never include citations, footnotes, bracketed annotations, source markers, or commentary about your own answer or reasoning process.`;
 
     if (!process.env.GROQ_API_KEY) throw new Error("Missing GROQ_API_KEY");
 
@@ -115,12 +109,37 @@ RULES:
         { role: 'user', content: "Comment Thread:\n" + extractedText.substring(0, 6000) }
       ],
       temperature: 0.2,
-      response_format: { type: "json_object" }
+      // strict:true constrained decoding (live-verified against Groq's real API to
+      // work for this model) - directly, structurally prevents the malformed-array
+      // bug below by making an array with more than 3 elements impossible to
+      // generate, rather than only detecting it after the fact via sanitization.
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: 'comment_summary',
+          strict: true,
+          schema: {
+            type: 'object',
+            properties: {
+              consensus: { type: 'string' },
+              takeaways: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 3 },
+              criticisms: { type: 'array', items: { type: 'string' }, minItems: 0, maxItems: 3 },
+            },
+            required: ['consensus', 'takeaways', 'criticisms'],
+            additionalProperties: false,
+          },
+        },
+      },
     }, {
       headers: {
         'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
         'Content-Type': 'application/json'
-      }
+      },
+      // Found live while debugging an unrelated stall in ingest.js: this call
+      // had no request timeout at all, same gap. Here it's worse - a hung
+      // Groq response would leave a real user's HTTP request hanging
+      // indefinitely instead of just delaying a background cron run.
+      timeout: 30000,
     });
 
     const responseText = groqRes.data.choices[0].message.content.trim();
