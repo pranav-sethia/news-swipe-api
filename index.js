@@ -80,6 +80,7 @@ const startServer = async () => {
     await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_hash TEXT;');
     await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires TIMESTAMPTZ;');
     await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider TEXT NOT NULL DEFAULT 'password';");
+    await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS matches_unlocked_at TIMESTAMPTZ;');
     // An incrementally-maintained session vector + streak-counter mechanism
     // was tried and abandoned in favor of computing everything fresh from
     // user_swipes at read time (see routes/feed.js) - two time-decay

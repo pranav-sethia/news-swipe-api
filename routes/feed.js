@@ -697,18 +697,23 @@ router.get('/api/feed', apiActionLimiter, async (req, res) => {
     assembled.reverse();
 
     // --- Badges and labeling ---
+    // badgeEligible gates EVERY card, regardless of which pool it was
+    // retrieved from - a popular/discovery card served as filler while the
+    // smart pool runs thin must still show the same "building your taste"
+    // progress as a smart card would, not its own type-specific badge.
+    // Otherwise onboarding cards flicker between dots and Popular/Discovery
+    // labels depending on which pool happened to fill a given pick.
     assembled.forEach(r => {
-      if (r.__type === 'smart') {
-        if (badgeEligible) {
-          const sim = parseFloat(r.similarity_raw);
-          let norm = (sim - 0.1) / 0.7;
-          norm = Math.max(0, Math.min(1, norm));
-          r.match_pct = Math.round(50 + norm * 49);
-        } else {
-          r.match_pct = null;
-          r.taste_progress = Math.min(likeCount, LIKES_NEEDED_FOR_MATCHES);
-          r.swipes_until_matches = Math.max(0, LIKES_NEEDED_FOR_MATCHES - likeCount);
-        }
+      if (!badgeEligible) {
+        r.match_pct = null;
+        r.taste_progress = Math.min(likeCount, LIKES_NEEDED_FOR_MATCHES);
+        r.swipes_until_matches = Math.max(0, LIKES_NEEDED_FOR_MATCHES - likeCount);
+        delete r.discovery_type;
+      } else if (r.__type === 'smart') {
+        const sim = parseFloat(r.similarity_raw);
+        let norm = (sim - 0.1) / 0.7;
+        norm = Math.max(0, Math.min(1, norm));
+        r.match_pct = Math.round(50 + norm * 49);
       } else if (r.__type === 'popular') {
         r.match_pct = null;
         r.discovery_type = 'popular';
