@@ -290,6 +290,12 @@ router.get('/api/feed', apiActionLimiter, async (req, res) => {
     });
 
     const likeWeight = likeCount / (likeCount + TASTE_CONFIDENCE_M);
+    // Hoisted from the badge-labeling block further down - now also gates
+    // onboarding card-type ordering (see pinnedType in the assembleBatch
+    // call below). One hard, literal threshold (LIKES_NEEDED_FOR_MATCHES),
+    // deliberately distinct from the continuous likeWeight confidence dial
+    // directly above.
+    const badgeEligible = likeCount >= LIKES_NEEDED_FOR_MATCHES;
     function categoryLikeWeight(cat) {
       const n = catLikeCount.get(cat) || 0;
       return n / (n + TASTE_CONFIDENCE_M);
@@ -615,6 +621,13 @@ router.get('/api/feed', apiActionLimiter, async (req, res) => {
       isOnCooldown: isCategoryOnSkipCooldown,
       dislikedSet: D,
       categoriesWithSignal: new Set(categoriesWithSignal),
+      // Before the user has unlocked matches, force every card to be a
+      // "smart"/building-your-taste card (falling back to popular/discovery
+      // only if that pool is genuinely exhausted) instead of the normal
+      // weighted-random mix - a new user should see an unbroken, purposeful
+      // taste-building sequence with visible progress dots, not a confusing
+      // early mix of purposeful and random-feeling cards.
+      pinnedType: badgeEligible ? null : 'smart',
     });
 
     // Reverse to match the existing "weakest at index 0 (shown last),
@@ -623,7 +636,6 @@ router.get('/api/feed', apiActionLimiter, async (req, res) => {
     assembled.reverse();
 
     // --- Badges and labeling ---
-    const badgeEligible = likeCount >= LIKES_NEEDED_FOR_MATCHES;
     assembled.forEach(r => {
       if (r.__type === 'smart') {
         if (badgeEligible) {

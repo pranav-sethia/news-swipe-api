@@ -65,6 +65,17 @@ function assembleBatch({
   isOnCooldown,
   dislikedSet,
   categoriesWithSignal,
+  // Forces type-selection to 'smart' every pick instead of the normal
+  // weighted-random draw - passed as 'smart' from feed.js during onboarding
+  // (before badgeEligible), so a new user reliably sees "building your
+  // taste" cards instead of an early, confusing mix with popular/discovery
+  // cards that carry no progress indication at all. Still falls through to
+  // the normal orderedTypes fallback (and its full per-stage relaxation) if
+  // the pinned type's candidate pool is genuinely exhausted for a pick -
+  // that machinery is unchanged, just fed a fixed primaryType instead of a
+  // drawn one. Leave null/undefined (the default, used once badgeEligible)
+  // to keep today's weighted-random behavior exactly as-is.
+  pinnedType,
 }) {
   const picked = [];
   const usedIds = new Set();
@@ -214,19 +225,38 @@ function assembleBatch({
     const deficits = ['smart', 'popular', 'discovery']
       .map(type => ({ type, deficit: (targetShares[type] || 0) - (typeCounts[type] / totalSoFar) }));
 
-    const primaryType = pickWeightedType(deficits);
-    const orderedTypes = [primaryType, ...deficits
-      .filter(d => d.type !== primaryType)
-      .sort((a, b) => b.deficit - a.deficit)
-      .map(d => d.type)];
-
     let chosen = null;
     let chosenType = null;
-    outer:
-    for (const stage of relaxationStages) {
-      for (const type of orderedTypes) {
-        const candidate = pickBestFromType(type, stage);
-        if (candidate) { chosen = candidate; chosenType = type; break outer; }
+
+    // pinnedType must fully exhaust ITS OWN relaxation ladder before any
+    // other type is even considered - the stage-major loop below tries
+    // every type at each stage before relaxing further for one, which would
+    // otherwise let a merely-tied cap check (e.g. violatesPortfolioCap's
+    // ratio spiking to 100% on pick #1, before the trailing window has any
+    // real content to average against - live-confirmed: this silently
+    // handed EVERY onboarding user's first pick to 'popular' instead of
+    // 'smart') win a slot the pinned type would have gotten had it been
+    // allowed to relax its own caps first.
+    if (pinnedType) {
+      for (const stage of relaxationStages) {
+        const candidate = pickBestFromType(pinnedType, stage);
+        if (candidate) { chosen = candidate; chosenType = pinnedType; break; }
+      }
+    }
+
+    if (!chosen) {
+      const primaryType = pinnedType || pickWeightedType(deficits);
+      const orderedTypes = [primaryType, ...deficits
+        .filter(d => d.type !== primaryType)
+        .sort((a, b) => b.deficit - a.deficit)
+        .map(d => d.type)];
+      outer:
+      for (const stage of relaxationStages) {
+        for (const type of orderedTypes) {
+          if (pinnedType && type === pinnedType) continue; // already fully exhausted above
+          const candidate = pickBestFromType(type, stage);
+          if (candidate) { chosen = candidate; chosenType = type; break outer; }
+        }
       }
     }
     if (!chosen) break; // every candidate pool is genuinely exhausted - stop rather than loop forever
