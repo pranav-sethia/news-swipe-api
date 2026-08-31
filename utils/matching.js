@@ -76,6 +76,12 @@ function assembleBatch({
   // drawn one. Leave null/undefined (the default, used once badgeEligible)
   // to keep today's weighted-random behavior exactly as-is.
   pinnedType,
+  // Embeddings of articles the user was recently actually shown, from
+  // BEFORE this call (most-recent-first, already capped to a reasonable
+  // window by the caller) - extends the MMR near-duplicate check below
+  // across separate /api/feed calls, not just within this one batch. See
+  // the comment in feed.js where this is built for why it's needed.
+  recentlyShownEmbeddings = [],
 }) {
   const picked = [];
   const usedIds = new Set();
@@ -122,6 +128,11 @@ function assembleBatch({
         let tooSimilar = false;
         for (const p of picked) {
           if (cosineSimilarity(c.parsed_embedding, p.parsed_embedding) > 0.90) { tooSimilar = true; break; }
+        }
+        if (!tooSimilar) {
+          for (const emb of recentlyShownEmbeddings) {
+            if (cosineSimilarity(c.parsed_embedding, emb) > 0.90) { tooSimilar = true; break; }
+          }
         }
         if (tooSimilar) continue;
       }

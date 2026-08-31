@@ -178,7 +178,18 @@ router.get('/api/feed', apiActionLimiter, async (req, res) => {
     // zero parallelism, for a self-correcting edge case. Not worth it;
     // reverted to plain pool.query with real parallelism instead.)
     const [userResult, excludeCategoriesResult, likeDislikeResult, skipResult] = await Promise.all([
-      pool.query('SELECT taste_vector FROM users WHERE id = $1', [userId]),
+      // Falls back to the pre-migration column set if matches_unlocked_at
+      // doesn't exist yet (Postgres 42703 = undefined_column) - this code
+      // and the migration that adds the column aren't guaranteed to land at
+      // exactly the same moment, and a hard failure here would 500 every
+      // single feed request in the gap. Missing the column just means
+      // badgeEligible falls back to its live-computed check below, same as
+      // before this feature existed - a safe degradation, not a crash.
+      pool.query('SELECT taste_vector, matches_unlocked_at FROM users WHERE id = $1', [userId])
+        .catch(err => {
+          if (err.code === '42703') return pool.query('SELECT taste_vector FROM users WHERE id = $1', [userId]);
+          throw err;
+        }),
       excludeIds.length
         ? pool.query('SELECT category FROM articles WHERE id = ANY($1::int[])', [excludeIds])
         : Promise.resolve({ rows: [] }),
@@ -202,6 +213,7 @@ router.get('/api/feed', apiActionLimiter, async (req, res) => {
       `, [userId]),
     ]);
     const onboardingVector = userResult.rows[0]?.taste_vector ? parseVector(userResult.rows[0].taste_vector) : null;
+    const matchesUnlockedAt = userResult.rows[0]?.matches_unlocked_at || null;
     // Categories of the client's currently-kept, not-yet-swiped on-screen
     // cards - served but invisible to the swipe log. Needed so the
     // near-duplicate filter, portfolio cap, and run-length cap aren't blind
@@ -216,6 +228,22 @@ router.get('/api/feed', apiActionLimiter, async (req, res) => {
     // true chronological order across both.
     const swipeRows = [...likeDislikeResult.rows, ...skipResult.rows]
       .sort((a, b) => parseFloat(a.hours_ago) - parseFloat(b.hours_ago));
+
+    // Near-duplicate (MMR) protection in assembleBatch only ever compared
+    // candidates against the batch it was currently building - it had no
+    // memory of anything shown in a PREVIOUS /api/feed call. Since the
+    // frontend refetches on nearly every swipe, most calls only ever
+    // contribute 1-2 displayed cards before the next call's MMR context
+    // resets to empty, so two near-identical articles (e.g. two write-ups of
+    // the same story) could be served back-to-back across separate fetches
+    // with nothing to stop it - worst during onboarding, where the low/zero-
+    // signal smart pool is largely the same small set of top candidates on
+    // every consecutive call. swipeRows is already sorted most-recent-first,
+    // so this reuses data already fetched above rather than a new query.
+    const RECENT_MMR_WINDOW = 20;
+    const recentlyShownEmbeddings = swipeRows.slice(0, RECENT_MMR_WINDOW)
+      .filter(r => r.embedding)
+      .map(r => parseVector(r.embedding));
 
     const dim = onboardingVector ? onboardingVector.length : (swipeRows[0] ? parseVector(swipeRows[0].embedding).length : 384);
     const sumCore = new Array(dim).fill(0);
@@ -295,7 +323,26 @@ router.get('/api/feed', apiActionLimiter, async (req, res) => {
     // call below). One hard, literal threshold (LIKES_NEEDED_FOR_MATCHES),
     // deliberately distinct from the continuous likeWeight confidence dial
     // directly above.
-    const badgeEligible = likeCount >= LIKES_NEEDED_FOR_MATCHES;
+    //
+    // Sticky once earned: matches_unlocked_at is a one-time milestone, not a
+    // live recomputation. Without it, undoing your most recent swipe (a
+    // single click, right after it happens to be your 3rd like) or unliking
+    // any old article from the sidebar's liked-articles list would silently
+    // drop a user back into onboarding after they'd already unlocked real
+    // matches - a confusing, unearned regression for what's meant to be a
+    // permanent milestone. A full /api/reset DOES clear this column (see
+    // routes/swipe.js) since that's an explicit "start over" action, unlike
+    // an incidental undo/unlike.
+    const badgeEligible = matchesUnlockedAt != null || likeCount >= LIKES_NEEDED_FOR_MATCHES;
+    if (badgeEligible && matchesUnlockedAt == null) {
+      // Lazily persist the milestone the first time it's observed, rather
+      // than writing it from the swipe route - keeps routes/swipe.js's
+      // "pure log-writing, nothing derived is cached" design intact, and
+      // this UPDATE is naturally idempotent (guarded by IS NULL) no matter
+      // how many concurrent requests race to set it.
+      pool.query('UPDATE users SET matches_unlocked_at = NOW() WHERE id = $1 AND matches_unlocked_at IS NULL', [userId])
+        .catch(err => console.error('Error persisting matches_unlocked_at:', err));
+    }
     function categoryLikeWeight(cat) {
       const n = catLikeCount.get(cat) || 0;
       return n / (n + TASTE_CONFIDENCE_M);
@@ -423,6 +470,18 @@ router.get('/api/feed', apiActionLimiter, async (req, res) => {
           ORDER BY a.embedding <=> $1
           LIMIT $3
         `, [`[${retrievalVector.join(',')}]`, userId, CANDIDATE_FETCH, excludeIds])
+      // Zero-signal fallback (no swipes, no onboarding vector yet) - this is
+      // the ENTIRE "smart"/"building your taste" candidate pool for a
+      // brand-new user, who (as of pinnedType, see assembleBatch call below)
+      // will see nothing but cards from this pool until their first real
+      // match unlocks. A pure recency ordering with no popularity signal at
+      // all meant a genuinely great article from 2-3 days ago could already
+      // have fallen out of the CANDIDATE_FETCH=40 most-recent window before
+      // ever getting a chance to be re-ranked by score - there's no real
+      // personalization signal to protect yet, so putting a strong,
+      // popularity-aware foot forward for exactly the users who most need a
+      // good first impression is free (same "nothing to protect" argument
+      // COLDSTART_NEAR_TIE_BONUS already makes for near-tie randomization).
       : pool.query(`
           SELECT id, title, description, article_url, image_url, source_name, published_at,
                  score, num_comments, hn_id, embedding, read_time_minutes, category,
@@ -431,7 +490,8 @@ router.get('/api/feed', apiActionLimiter, async (req, res) => {
           WHERE embedding IS NOT NULL
             AND NOT EXISTS (SELECT 1 FROM user_swipes us2 WHERE us2.user_id = $1 AND us2.article_id = articles.id)
             AND NOT (id = ANY($3::int[]))
-          ORDER BY published_at DESC
+            AND published_at::timestamp > NOW() - INTERVAL '30 days'
+          ORDER BY score DESC, published_at DESC
           LIMIT $2
         `, [userId, CANDIDATE_FETCH, excludeIds]);
 
@@ -628,6 +688,7 @@ router.get('/api/feed', apiActionLimiter, async (req, res) => {
       // taste-building sequence with visible progress dots, not a confusing
       // early mix of purposeful and random-feeling cards.
       pinnedType: badgeEligible ? null : 'smart',
+      recentlyShownEmbeddings,
     });
 
     // Reverse to match the existing "weakest at index 0 (shown last),
@@ -688,7 +749,7 @@ router.get('/api/feed', apiActionLimiter, async (req, res) => {
       delete r.recent_similarity_raw;
       delete r.final_score;
       delete r.__type;
-      if (!(r.match_pct)) delete r.match_reason;
+      if (r.match_pct == null) delete r.match_reason;
     });
 
     res.json(assembled);
