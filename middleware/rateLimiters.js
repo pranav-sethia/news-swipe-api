@@ -39,11 +39,13 @@ const summaryPerUserLimiter = rateLimit({
 // an earlier docs paraphrase that claimed a single shared pool). ingest.js
 // was moved to a different model (qwen/qwen3.8-27b, see ingest.js) for
 // exactly this reason - it now draws from its own independent 8,000
-// tokens/min, 2,000,000 tokens/day budget, so its periodic 2-hour bursts no
-// longer compete with this route's budget at all. This route's model
-// (openai/gpt-oss-20b) keeps its own 8,000 tokens/min, 200,000 tokens/day
-// budget, live-confirmed via /docs/rate-limits and matched exactly by live
-// response headers. Live-measured against the real
+// tokens/min, 200,000 tokens/day budget (both models actually share the
+// same free-tier limit - an earlier claim of 2,000,000 TPD for qwen was
+// wrong, corrected after re-checking Groq's own rate-limits page directly),
+// so its periodic 2-hour bursts no longer compete with this route's budget
+// at all. This route's model (openai/gpt-oss-20b) keeps its own 8,000
+// tokens/min, 200,000 tokens/day budget, live-confirmed via /docs/rate-limits
+// and matched exactly by live response headers. Live-measured against the real
 // /api/comments/:hnId/summary route itself (not just an equivalent raw
 // prompt): real threads cost 1,300-1,800 total tokens depending on comment
 // volume, with reasoning_tokens consistently ~4 (confirms reasoning_effort:

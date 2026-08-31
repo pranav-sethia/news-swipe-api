@@ -19,6 +19,21 @@ const IMAGE_CHECK_TIMEOUT_MS = 5000;
 // but bounds the failure mode to "one retry-able error" instead of "hangs
 // forever."
 const GROQ_CALL_TIMEOUT_MS = 30000;
+// qwen/qwen3.8-27b's real free-tier budget is 200,000 tokens/day, not the
+// 2,000,000 previously assumed here (that number was wrong - live-verified
+// against Groq's own rate-limits page and matched against live response
+// headers; both qwen/qwen3.8-27b and openai/gpt-oss-20b share the same
+// 200,000 TPD free-tier limit). At realistic volume (~190-200 articles/day)
+// and ~1,800 tokens/call, a single account is ~1.7-1.8x OVER that budget on
+// its own - likely the real explanation for 429s seen well before today's
+// self-consistency-voting change (now removed, see below). GROQ_API_KEY_2 is
+// a second Groq account's key, used on alternating cron runs (this cron
+// fires every 2 hours - see .github/workflows/ingest.yml) so each account
+// only needs to cover ~half the day's runs, comfortably inside its own
+// 200,000 TPD. Falls back to the primary key if the second isn't set yet
+// (e.g. locally, or before it's added as a GitHub Actions secret).
+const runIndex = Math.floor(new Date().getUTCHours() / 2);
+const GROQ_API_KEY_ACTIVE = (runIndex % 2 === 0 ? process.env.GROQ_API_KEY : process.env.GROQ_API_KEY_2) || process.env.GROQ_API_KEY;
 const MIN_IMAGE_DIMENSION = 200;
 // Calibrated against a real near-black Twitter video-thumbnail placeholder
 // (mean ~3) vs. legitimate article images (mean 85-245) - comfortably below
@@ -94,89 +109,6 @@ async function getEmbedding(text) {
 
 const ALLOWED_CATEGORIES = ["Software Engineering", "Hardware & Systems", "Artificial Intelligence", "Startups & VC", "Cybersecurity", "Business & Finance", "Science & Space", "Design & UI/UX", "Other"];
 
-// Lightweight category-only vote for self-consistency checking - reuses the
-// same TAXONOMY/RULE-1 text as the primary call (kept in sync manually,
-// see getSummary) but skips bullets/tags/relevance_flag entirely, so it's not
-// meaningfully cheaper than the full call (input tokens - the article text -
-// dominate cost either way) but avoids paying for bullet/tag generation we'd
-// throw away. Uses a higher temperature than the primary call's 0 specifically
-// to get genuine sample diversity - voting with more temp=0 calls would just
-// repeat the same answer for no benefit (live-confirmed this session).
-async function voteCategory(text, title) {
-  const systemPrompt = `You are a precision taxonomy and classification engine for a technology news aggregator. Your task is to analyze the provided text and output a JSON object.`;
-  const promptText = `Classify the following text into exactly ONE of the following categories based on its primary theme:
-
-TAXONOMY:
-- Software Engineering: Programming languages, web/mobile development, databases, algorithms, DevOps, infrastructure, open-source projects, game development, and software architecture.
-- Hardware & Systems: Semiconductors, GPUs, networking, servers, operating systems, embedded systems, robotics, IoT, self-driving technology, and consumer electronics (e.g., Apple hardware).
-- Artificial Intelligence: LLMs, machine learning, neural networks, computer vision, data science, NLP, and AI agents. Reserved for articles primarily about the technology, research, or techniques themselves.
-- Startups & VC: Early-stage companies, venture capital, fundraising, incubators (like YC), entrepreneurship, founders, and product management.
-- Cybersecurity: Vulnerabilities, hacking, zero-days, infosec, privacy laws, encryption (non-crypto), malware, and network security.
-- Business & Finance: Corporate acquisitions (M&A), earnings reports, stock market, tech industry economics, Big Tech antitrust/lawsuits, layoffs, FCC/FTC tech regulations, enterprise pricing, and blockchain/cryptocurrency business or regulatory news.
-- Science & Space: Physics, biology, biotech, medicine, astronomy, aerospace (e.g., SpaceX), mathematics, climate tech, and energy.
-- Design & UI/UX: Typography, frontend aesthetics, user experience research, human-computer interaction (HCI), and web accessibility.
-- Other: Any topic that does not clearly and specifically match one of the categories above. This is the default for anything outside technology, science, or business: music, art, food, general or classical history, language and linguistics, personal essays, hobbies, internet culture, and similar. When in doubt between Other and a narrow specific category like Design & UI/UX, prefer Other unless the article is unambiguously and primarily about that specific category's subject matter.
-
-RULES:
-1. Determine the PRIMARY theme, not just mentioned keywords. If an article is fundamentally about a company's funding round, valuation, or other early-stage deal mechanics, classify it as Startups & VC, even when the company's product involves AI. If it is fundamentally about an acquisition, earnings, or other corporate/market news, classify it as Business & Finance, even when the company involved is an AI company. Reserve Artificial Intelligence for articles primarily about the technology, research, or techniques themselves, not company or deal news that happens to mention AI.
-2. You must provide your step-by-step reasoning BEFORE outputting the final category.`;
-  try {
-    const voteTimeout = new AbortController();
-    const voteTimeoutId = setTimeout(() => voteTimeout.abort(), GROQ_CALL_TIMEOUT_MS);
-    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      signal: voteTimeout.signal,
-      headers: { 'Authorization': `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'qwen/qwen3.8-27b',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: promptText + "\n\nTitle: " + title + "\n\nArticle Text:\n" + text.substring(0, 4000) }
-        ],
-        temperature: 0.35,
-        response_format: {
-          type: 'json_schema',
-          json_schema: {
-            name: 'category_vote',
-            strict: true,
-            schema: {
-              type: 'object',
-              properties: {
-                reasoning: { type: 'string' },
-                category: { type: 'string', enum: ALLOWED_CATEGORIES },
-              },
-              required: ['reasoning', 'category'],
-              additionalProperties: false,
-            },
-          },
-        },
-      }),
-    });
-    clearTimeout(voteTimeoutId);
-    const rateLimitInfo = {
-      remainingTokens: parseInt(res.headers.get('x-ratelimit-remaining-tokens'), 10),
-      resetTokensMs: parseGroqDurationMs(res.headers.get('x-ratelimit-reset-tokens')),
-    };
-    if (!res.ok) return { category: null, rateLimitInfo };
-    const data = await res.json();
-    const parsed = JSON.parse(data.choices[0].message.content.trim());
-    const category = ALLOWED_CATEGORIES.includes(parsed.category) ? parsed.category : null;
-    return { category, rateLimitInfo };
-  } catch {
-    return { category: null, rateLimitInfo: null };
-  }
-}
-
-// Conservative aggregation across the primary call + 2 vote calls' rate-limit
-// headers - takes whichever reading shows the LEAST remaining budget, so the
-// caller's adaptive pacing (computeAdaptiveDelayMs) accounts for all 3 calls'
-// real consumption, not just the primary call's (now-stale) snapshot.
-function mostDepleted(...infos) {
-  const valid = infos.filter(i => i && Number.isFinite(i.remainingTokens));
-  if (!valid.length) return infos.find(Boolean) || null;
-  return valid.reduce((min, i) => (i.remainingTokens < min.remainingTokens ? i : min));
-}
-
 async function getSummary(text, title) {
   // 200 chars (~30 words) let near-empty scrapes (cookie banners, stub pages) through;
   // 500 is closer to a real minimum paragraph of article content.
@@ -215,6 +147,7 @@ Rules for bullets: They MUST be grammatically correct sentence fragments contain
     if (!process.env.GROQ_API_KEY) {
       throw new Error("Missing GROQ_API_KEY environment variable. Cloud ingestion requires this key.");
     }
+    const groqApiKey = GROQ_API_KEY_ACTIVE;
 
     let res, data;
     let retries = 3;
@@ -225,7 +158,7 @@ Rules for bullets: They MUST be grammatically correct sentence fragments contain
         method: 'POST',
         signal: groqTimeout.signal,
         headers: {
-          'Authorization': `Bearer ${process.env.GROQ_API_KEY}`,
+          'Authorization': `Bearer ${groqApiKey}`,
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
@@ -239,14 +172,17 @@ Rules for bullets: They MUST be grammatically correct sentence fragments contain
           //
           // qwen/qwen3.8-27b, not openai/gpt-oss-20b (used by
           // routes/comments.js): since Groq's rate limits are per-model, this
-          // gives ingestion its own free budget - 8,000 tokens/min (same as
-          // gpt-oss-20b) but 2,000,000 tokens/DAY vs gpt-oss-20b's 200,000 -
-          // confirmed live via /docs/rate-limits, matched exactly by live
-          // response headers. Live-tested side by side against gpt-oss-20b
-          // on this exact prompt (a clean case and a genuinely ambiguous
-          // AI-vs-Business&Finance one): identical category decisions,
-          // comparably specific bullets, comparable real token cost (~1,700-
-          // 1,930/call). Not a reasoning model - no reasoning_effort param.
+          // gives ingestion its own free budget, independent of comments.js's -
+          // both share the same 8,000 tokens/min, 200,000 tokens/day free-tier
+          // limit (confirmed live via /docs/rate-limits' own embedded data,
+          // matched exactly by live response headers - an earlier claim of
+          // 2,000,000 TPD for this model was wrong). Live-tested side by side
+          // against gpt-oss-20b on this exact prompt (a clean case and a
+          // genuinely ambiguous AI-vs-Business&Finance one): identical
+          // category decisions, comparably specific bullets, comparable real
+          // token cost (~1,700-1,930/call). Not a reasoning model - no
+          // reasoning_effort param. See GROQ_API_KEY_ACTIVE above for how the
+          // real 200K/day budget is stretched to cover realistic volume.
           model: 'qwen/qwen3.8-27b',
           messages: [
             { role: 'system', content: systemPrompt },
@@ -255,9 +191,8 @@ Rules for bullets: They MUST be grammatically correct sentence fragments contain
           // temperature 0, not 0.1 - live-tested against real, targeted
           // boundary-case articles (genuinely confusable category pairs):
           // temp=0 alone fully stabilized every case that showed any
-          // instability at 0.1, at zero added cost. Self-consistency voting
-          // below (voteCategory) catches the rarer residual case where even
-          // temp=0 could differ from the "true" better answer.
+          // instability at 0.1, at zero added cost (self-consistency voting
+          // was tried on top of this and removed - see finalCategory below).
           temperature: 0,
           // strict:true constrained decoding, not just json_object mode - live-verified
           // against Groq's real API (both this model and openai/gpt-oss-20b support it)
@@ -368,27 +303,18 @@ Rules for bullets: They MUST be grammatically correct sentence fragments contain
     // support a reliable ranking signal, see the taxonomy distribution check).
     // The model shouldn't output it anymore given the prompt above, but remap
     // defensively in case it does.
-    const primaryCategory = parsed.category === "Web3 & Crypto"
+    // Self-consistency voting (2 extra category-only calls/article) was tried
+    // and removed: it tripled this call's Groq load against what turned out
+    // to be a real 200,000 tokens/day budget (not the 2,000,000 assumed when
+    // voting was added - see GROQ_API_KEY_ACTIVE above), and the case it was
+    // shown to fix ("Quantifying Colour," unstable at temperature 0.1) was
+    // never shown to still be unstable once temperature=0 (below) was
+    // already applied - the two fixes were validated as alternatives to each
+    // other, not proven to compound. temperature=0 alone already stabilized
+    // every real boundary-instability case found this session, for free.
+    const finalCategory = parsed.category === "Web3 & Crypto"
       ? "Business & Finance"
       : (ALLOWED_CATEGORIES.includes(parsed.category) ? parsed.category : "Other");
-
-    // Self-consistency voting: 2 more lightweight category-only calls at a
-    // higher temperature (genuine sample diversity, unlike more temp=0 calls
-    // which would just repeat the same answer), majority vote against the
-    // primary. Catches the rarer residual sampling instability temp=0 alone
-    // doesn't - live-tested this session. On a 3-way split with no majority,
-    // fall back to the primary (temp=0) call's own category, the single most
-    // deterministic sample available.
-    const [voteResult1, voteResult2] = await Promise.all([voteCategory(text, title), voteCategory(text, title)]);
-    const votes = [primaryCategory, voteResult1.category, voteResult2.category].filter(Boolean);
-    const voteCounts = {};
-    votes.forEach(v => { voteCounts[v] = (voteCounts[v] || 0) + 1; });
-    const [topCategory, topCount] = Object.entries(voteCounts).sort((a, b) => b[1] - a[1])[0];
-    const finalCategory = topCount >= 2 ? topCategory : primaryCategory;
-    if (finalCategory !== primaryCategory || new Set(votes).size > 1) {
-      console.log(`ℹ️ Category vote non-unanimous for "${title}": primary=${primaryCategory}, votes=[${votes.join(', ')}], final=${finalCategory}`);
-    }
-    const combinedRateLimitInfo = mostDepleted(rateLimitInfo, voteResult1.rateLimitInfo, voteResult2.rateLimitInfo);
 
     // Same real-sample check caught tags mid-word truncated at a bare 20-char
     // cut ("government surveilla", "spectral power distr") - not currently
@@ -403,7 +329,7 @@ Rules for bullets: They MUST be grammatically correct sentence fragments contain
       tags: validTags,
       bullets: parsed.bullets,
       relevanceFlag: parsed.relevance_flag,
-      rateLimitInfo: combinedRateLimitInfo
+      rateLimitInfo
     };
   } catch (error) {
     // Distinguishable from the "not enough text" short-circuit above: this
