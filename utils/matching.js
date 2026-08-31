@@ -64,10 +64,16 @@ function assembleBatch({
   nearTieMargin,
   isOnCooldown,
   dislikedSet,
+  categoriesWithSignal,
 }) {
   const picked = [];
   const usedIds = new Set();
   const typeCounts = { smart: 0, popular: 0, discovery: 0 };
+  // Category-level deficit floor WITHIN the smart slot - see the
+  // category-weighted selection in pickBestFromType below for why this
+  // exists (heterogeneous-category fairness, not just type fairness).
+  const smartCategoryCounts = new Map();
+  let smartPickedCount = 0;
 
   function trailingCategoryWindow(n) {
     const combined = [...initialCategorySequence, ...picked.map(p => p.category)];
@@ -111,6 +117,50 @@ function assembleBatch({
       eligible.push(c);
     }
     if (!eligible.length) return null;
+
+    if (type === 'smart') {
+      // A flat score-sort here structurally favors whichever liked
+      // category's embeddings happen to cluster tighter (higher raw cosine
+      // similarity for a merely-decent match) over one that's genuinely
+      // liked just as much but is more semantically spread out - live-
+      // confirmed with "Other" (philosophy/world-events/personal-essay
+      // articles the user explicitly said they loved) never once winning a
+      // slot against Artificial Intelligence/Software Engineering, despite
+      // a comparable like count, because AI/SWE embeddings simply sit
+      // closer together in vector space. portfolioCapShareFn already
+      // expresses "how much of the smart slot this category has earned" -
+      // reusing it here as a target share (not just a ceiling) makes each
+      // earned category compete for its own deficit-scheduled slot instead
+      // of one global ranking, the same fix already applied one level up
+      // for type selection.
+      const byCategory = new Map();
+      eligible.forEach(c => {
+        const cat = c.category || null;
+        if (!byCategory.has(cat)) byCategory.set(cat, []);
+        byCategory.get(cat).push(c);
+      });
+      const categoryDeficits = [...byCategory.keys()].map(cat => {
+        // Only a category the user has actually earned signal in gets an
+        // active floor target - otherwise EVERY never-liked category
+        // inherits portfolioCapShareFn's 0.35 baseline too (it's meant as a
+        // ceiling floor for categories that already show up, not a promotion
+        // target for ones the user has never once engaged with), which
+        // live-testing showed washes out real personalization: unsignaled
+        // categories matched exactly as often as genuinely-liked ones.
+        const hasSignal = cat && categoriesWithSignal && categoriesWithSignal.has(cat);
+        const target = hasSignal ? portfolioCapShareFn(cat) : 0;
+        const count = smartCategoryCounts.get(cat) || 0;
+        const totalSoFar = smartPickedCount || 1;
+        return { type: cat, deficit: target - (count / totalSoFar) };
+      });
+      const chosenCat = pickWeightedType(categoryDeficits);
+      const pool = byCategory.get(chosenCat); // already best-first, `eligible` preserves candidatesByType's incoming order
+      const topScore = pool[0].final_score;
+      const margin = Math.abs(topScore) * nearTieMargin;
+      const nearTies = pool.filter(c => topScore - c.final_score <= margin);
+      return nearTies[Math.floor(Math.random() * nearTies.length)];
+    }
+
     // Near-tie randomization: among candidates within nearTieMargin of the
     // top score, pick at random rather than always the strict top-1 - fixes
     // a real cold-start fragility where the same single article was
@@ -133,17 +183,48 @@ function assembleBatch({
     { skipRunLength: true, skipPortfolio: true, skipMmr: true, skipCooldown: true },
   ];
 
+  // Weighted-random type selection, weight = max(deficit, TYPE_SELECTION_FLOOR)
+  // instead of strict argmax. On pick #1 of any call, `smart` almost always
+  // has the single largest target share, so a strict-max-deficit rule
+  // deterministically hands it EVERY call's first slot - harmless in
+  // isolation, but the frontend calls assembleBatch fresh on every single
+  // swipe (replaceStale) and keeps only the top 2 on-screen cards each time,
+  // so only that first pick ever reliably survives long enough to be shown.
+  // Live-confirmed result: across an 80-swipe realistic session, only 1
+  // popular-type and 1 discovery-type card were ever actually displayed,
+  // despite both having a healthy ~20%+ target share. Weighting pick #1
+  // (and every pick) by deficit rather than taking the strict max makes the
+  // type that actually reaches the user probabilistically track the target
+  // shares over many swipes, without changing the steady-state math for a
+  // single large batch.
+  const TYPE_SELECTION_FLOOR = 0.02;
+  function pickWeightedType(deficits) {
+    const weights = deficits.map(d => Math.max(d.deficit, TYPE_SELECTION_FLOOR));
+    const total = weights.reduce((s, w) => s + w, 0);
+    let r = Math.random() * total;
+    for (let i = 0; i < deficits.length; i++) {
+      r -= weights[i];
+      if (r <= 0) return deficits[i].type;
+    }
+    return deficits[deficits.length - 1].type;
+  }
+
   while (picked.length < batchSize) {
     const totalSoFar = picked.length || 1;
     const deficits = ['smart', 'popular', 'discovery']
-      .map(type => ({ type, deficit: (targetShares[type] || 0) - (typeCounts[type] / totalSoFar) }))
-      .sort((a, b) => b.deficit - a.deficit);
+      .map(type => ({ type, deficit: (targetShares[type] || 0) - (typeCounts[type] / totalSoFar) }));
+
+    const primaryType = pickWeightedType(deficits);
+    const orderedTypes = [primaryType, ...deficits
+      .filter(d => d.type !== primaryType)
+      .sort((a, b) => b.deficit - a.deficit)
+      .map(d => d.type)];
 
     let chosen = null;
     let chosenType = null;
     outer:
     for (const stage of relaxationStages) {
-      for (const { type } of deficits) {
+      for (const type of orderedTypes) {
         const candidate = pickBestFromType(type, stage);
         if (candidate) { chosen = candidate; chosenType = type; break outer; }
       }
@@ -152,6 +233,10 @@ function assembleBatch({
 
     usedIds.add(chosen.id);
     typeCounts[chosenType] += 1;
+    if (chosenType === 'smart') {
+      smartPickedCount += 1;
+      smartCategoryCounts.set(chosen.category, (smartCategoryCounts.get(chosen.category) || 0) + 1);
+    }
     picked.push({ ...chosen, __type: chosenType });
   }
 
