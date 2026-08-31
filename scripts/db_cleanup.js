@@ -1,9 +1,5 @@
 require('dotenv').config();
-const LanguageDetect = require('languagedetect');
 const pool = require('../db');
-
-const lngDetector = new LanguageDetect();
-lngDetector.setLanguageType('iso2'); // e.g. 'en'
 
 async function runCleanup() {
   const client = await pool.connect();
@@ -20,50 +16,31 @@ async function runCleanup() {
 
     const toDeleteIds = [];
     let countNoDescription = 0;
-    let countNonEnglish = 0;
 
+    // Language-based deletion (via the `languagedetect` package) was removed
+    // here after live-checking it against real production data: it's an
+    // n-gram model that needs real prose to work, and title + 3 terse ~50-
+    // char bullet fragments (condensed, jargon-dense, article-specific
+    // technical language, not natural sentence structure) isn't enough
+    // signal - it confidently misread genuinely English tech articles as
+    // French, Spanish, German, Slovak, and even Latin. Measured directly
+    // against 5 real recent cron runs: 14 of 57 freshly-saved, correctly-
+    // categorized articles (~25%) were being silently deleted minutes after
+    // ingestion as false positives - in one run, 9 of 13 (69%). Given HN's
+    // content is effectively all English already, the risk of a genuinely
+    // non-English article slipping through is far smaller than the harm
+    // this was causing.
     for (const article of articles) {
-      // 1. Check for lack of description or very short description
+      // Check for lack of description or very short description
       const desc = article.description ? article.description.trim() : '';
       if (!desc || desc.length < 20) {
         toDeleteIds.push(article.id);
         countNoDescription++;
-        continue;
-      }
-
-      // 2. Check language
-      // We will test language on title + description to be safe. 
-      // Sometimes content is HTML or very short, but title+desc is usually a good indicator.
-      const textToAnalyze = `${article.title} ${desc}`.trim();
-      const detectedLangs = lngDetector.detect(textToAnalyze, 3);
-      
-      let isEnglish = false;
-      if (detectedLangs.length === 0) {
-        // If it can't detect, it might be just a short string of names. We'll give it the benefit of the doubt
-        // unless we want to be strict. Let's be lenient.
-        isEnglish = true; 
-      } else {
-        // Check if English is the top detected language, or at least in the top 3 with a decent score
-        const topLang = detectedLangs[0][0];
-        if (topLang === 'en') {
-          isEnglish = true;
-        } else {
-          // If english is in top 3 but very close score to top, maybe it's mixed.
-          // But usually top language is the main one.
-          isEnglish = false;
-        }
-      }
-
-      if (!isEnglish) {
-        toDeleteIds.push(article.id);
-        countNonEnglish++;
-        console.log(`[Non-English] ${article.title} (Detected: ${detectedLangs[0] ? detectedLangs[0][0] : 'none'})`);
       }
     }
 
     if (toDeleteIds.length > 0) {
       console.log(`\nFound ${countNoDescription} articles with no/short description.`);
-      console.log(`Found ${countNonEnglish} non-English articles.`);
       console.log(`Deleting a total of ${toDeleteIds.length} articles...`);
 
       // Deleting in chunks to avoid blowing up the query parameter limit
