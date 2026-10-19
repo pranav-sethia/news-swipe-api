@@ -1,10 +1,11 @@
 const express = require('express');
 const pool = require('../db');
+const { apiActionLimiter } = require('../middleware/rateLimiters');
 
 const router = express.Router();
 
 // GET /api/taste-profile
-router.get('/api/taste-profile', async (req, res) => {
+router.get('/api/taste-profile', apiActionLimiter, async (req, res) => {
   const userId = req.user.id;
   try {
     // Tally up the liked categories
@@ -36,7 +37,7 @@ router.get('/api/taste-profile', async (req, res) => {
 });
 
 // GET /api/stats
-router.get('/api/stats', async (req, res) => {
+router.get('/api/stats', apiActionLimiter, async (req, res) => {
   const userId = req.user.id;
   console.log(`Fetching stats for user ${userId}`);
 
@@ -71,7 +72,7 @@ router.get('/api/stats', async (req, res) => {
 });
 
 // GET /api/liked-articles
-router.get('/api/liked-articles', async (req, res) => {
+router.get('/api/liked-articles', apiActionLimiter, async (req, res) => {
   const userId = req.user.id;
   console.log(`Fetching liked articles for user ${userId}`);
 
@@ -92,7 +93,7 @@ router.get('/api/liked-articles', async (req, res) => {
 });
 
 // GET /api/me/stats
-router.get('/api/me/stats', async (req, res) => {
+router.get('/api/me/stats', apiActionLimiter, async (req, res) => {
   const userId = req.user.id;
   try {
     const query = `

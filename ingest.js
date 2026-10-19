@@ -350,22 +350,34 @@ async function scrapeHackerNews() {
     const response = await axios.get('https://hacker-news.firebaseio.com/v0/topstories.json');
     const top500Ids = response.data;
     
-    // Check which ones we already have
-    const existingResult = await pool.query('SELECT hn_id FROM articles');
+    // Check which ones we already have. Dedup on both hn_id AND article_url -
+    // two different HN submissions can point at the same underlying URL
+    // (cross-posts/resubmissions), and `articles.article_url` has its own
+    // UNIQUE constraint. Checking only hn_id let a same-URL duplicate pass
+    // this filter, burn a full Groq categorization call, then fail at insert
+    // with a caught-but-wasted "duplicate key value violates unique
+    // constraint" error - confirmed happening in ~3 of 5 real recent cron
+    // runs. Checking article_url here too catches it before Groq is ever
+    // called, and newly-queued URLs are added to the same set so two
+    // duplicates discovered within one run can't both slip through either.
+    const existingResult = await pool.query('SELECT hn_id, article_url FROM articles');
     const existingIds = new Set(existingResult.rows.map(row => String(row.hn_id)));
-    
+    const existingUrls = new Set(existingResult.rows.map(row => row.article_url));
+
     let newArticles = [];
-    
+
     for (const id of top500Ids) {
       if (newArticles.length >= 20) break; // Cap at 20 new articles to protect Groq 70B token limit
-      
+
       if (existingIds.has(String(id))) continue;
-      
+
       // Fetch details
       const itemRes = await axios.get(`https://hacker-news.firebaseio.com/v0/item/${id}.json`);
       const item = itemRes.data;
       if (!item || item.dead || item.deleted || item.type !== 'story' || !item.url) continue;
-      
+      if (existingUrls.has(item.url)) continue;
+      existingUrls.add(item.url);
+
       newArticles.push({
         hn_id: String(item.id),
         title: item.title,

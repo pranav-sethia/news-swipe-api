@@ -14,6 +14,7 @@ const swipeRoutes = require('./routes/swipe');
 const statsRoutes = require('./routes/stats');
 const onboardingRoutes = require('./routes/onboarding');
 const accountRoutes = require('./routes/account');
+const adminRoutes = require('./routes/admin');
 
 const app = express();
 const port = process.env.PORT || 4000;
@@ -26,7 +27,14 @@ app.set('trust proxy', 1);
 
 // --- Middleware ---
 // Supports a single origin or a comma-separated list, e.g. "https://hackerswipe.io,https://www.hackerswipe.io"
-const allowedOrigins = (process.env.FRONTEND_URL || '*').split(',').map(o => o.trim()).filter(Boolean);
+// Fails CLOSED (no origin allowed) if FRONTEND_URL is ever unset/misspelled on
+// a future redeploy, rather than silently opening CORS to every origin - a
+// missing env var should break obviously (no frontend can call the API), not
+// quietly become a security gap.
+const allowedOrigins = (process.env.FRONTEND_URL || '').split(',').map(o => o.trim()).filter(Boolean);
+if (allowedOrigins.length === 0) {
+  console.error('⚠️ FRONTEND_URL is not set - CORS will reject every cross-origin request.');
+}
 const allowedOrigin = allowedOrigins.length === 1 ? allowedOrigins[0] : allowedOrigins;
 // This is a pure JSON API consumed from a different origin (the Vercel-hosted frontend),
 // so relax CORP/CSP defaults that assume same-origin HTML serving.
@@ -50,6 +58,10 @@ app.get('/api/stats/public', authLimiter, async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+// --- Admin stats (shared-secret gated, not JWT) - deliberately mounted
+// before the JWT authMiddleware below, since it uses its own auth scheme. ---
+app.use(authLimiter, adminRoutes);
 
 // --- AUTH ENDPOINTS (Public) ---
 app.use(authRoutes);
