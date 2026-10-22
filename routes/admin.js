@@ -1,5 +1,6 @@
 const express = require('express');
 const pool = require('../db');
+const { authLimiter } = require('../middleware/rateLimiters');
 
 const router = express.Router();
 
@@ -15,7 +16,7 @@ const router = express.Router();
 // so guestUsers reflects guests active right now, not all guest sessions
 // ever started. PostHog's identified guest_started/signup_completed events
 // are the durable historical record if cumulative volume ever matters.
-router.get('/api/admin/stats', async (req, res) => {
+router.get('/api/admin/stats', authLimiter, async (req, res) => {
   const expectedSecret = process.env.ADMIN_SECRET;
   if (!expectedSecret || req.headers['x-admin-secret'] !== expectedSecret) {
     return res.status(401).json({ error: 'Unauthorized' });

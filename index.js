@@ -60,8 +60,12 @@ app.get('/api/stats/public', authLimiter, async (req, res) => {
 });
 
 // --- Admin stats (shared-secret gated, not JWT) - deliberately mounted
-// before the JWT authMiddleware below, since it uses its own auth scheme. ---
-app.use(authLimiter, adminRoutes);
+// before the JWT authMiddleware below, since it uses its own auth scheme.
+// The rate limiter is applied inside routes/admin.js on that specific route,
+// not here - mounting authLimiter at this app.use() with no path prefix
+// previously applied it (and its 30-req/15min budget) to every single
+// request on the API, not just /api/admin/stats. ---
+app.use(adminRoutes);
 
 // --- AUTH ENDPOINTS (Public) ---
 app.use(authRoutes);
