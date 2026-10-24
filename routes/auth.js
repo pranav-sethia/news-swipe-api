@@ -10,6 +10,17 @@ const { sendPasswordResetEmail, sendGoogleAccountNoticeEmail } = require('../ema
 const router = express.Router();
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
+// Append-only, never decremented by the guest-cleanup job - tracks true
+// lifetime signup volume separately from the live `users` row count, which
+// drops whenever scripts/cleanup_guests.js purges inactive guest rows.
+async function bumpLifetimeSignups(kind) {
+  await pool.query(
+    `INSERT INTO lifetime_signups (kind, count) VALUES ($1, 1)
+     ON CONFLICT (kind) DO UPDATE SET count = lifetime_signups.count + 1`,
+    [kind]
+  );
+}
+
 router.post('/auth/register', authLimiter, async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
@@ -42,6 +53,7 @@ router.post('/auth/register', authLimiter, async (req, res) => {
       const query = 'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id, email';
       const { rows } = await pool.query(query, [email, passwordHash]);
       user = rows[0];
+      await bumpLifetimeSignups('registered');
       console.log(`New user registered: ${email}`);
     }
 
@@ -205,6 +217,7 @@ router.post('/auth/guest', authLimiter, async (req, res) => {
       [guestEmail, hash]
     );
     const user = rows[0];
+    await bumpLifetimeSignups('guest');
     console.log(`✅ Ephemeral guest account created: ${guestEmail}`);
 
     const payload = { user: { id: user.id, email: user.email, isGuest: true } };
@@ -301,6 +314,7 @@ router.post('/api/auth/google', authLimiter, async (req, res) => {
       );
       user = inserted.rows[0];
       isNewUser = true;
+      await bumpLifetimeSignups('registered');
       console.log(`✅ Google SSO account created for ${email}`);
     } else if (user.auth_provider !== 'google') {
       // This email already has a real password account. Don't silently
